@@ -1,154 +1,306 @@
-from flask import Flask, request, jsonify
-from datetime import datetime, timezone
 import hashlib
 import json
 import math
 import re
 import unicodedata
-from copy import deepcopy
+from datetime import datetime, timezone, timedelta
+import os
+import threading
+
+from flask import Flask, request
 
 app = Flask(__name__)
 
-SAFE_MAX = 9007199254740991
 
-# Q2 persistent in-memory run storage
-RUNS = {}
+# ============================================================
+# Constants
+# ============================================================
 
-TS_RE = re.compile(
-    r"^(\d{4})-(\d{2})-(\d{2})T"
-    r"(\d{2}):(\d{2}):(\d{2})"
-    r"(?:\.(\d{1,3}))?"
-    r"(Z|[+-]\d{2}:\d{2})$"
-)
+OBJECT_CODES = {
+    "URI_INVALID",
+    "GENERATION_INVALID",
+    "GENERATION_MISMATCH",
+    "CRC32C_INVALID",
+    "CRC32C_MISMATCH",
+    "SCHEMA_INVALID",
+    "JSONL_INVALID",
+}
 
-HEX8_RE = re.compile(r"^[0-9a-f]{8}$")
-HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
-HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
-GEN_RE = re.compile(r"^[0-9]+$")
-URI_RE = re.compile(r"^gs://[^/\s]+/.+$")
+ROW_CODES = {
+    "DUPLICATE",
+    "POLICY_INVALID",
+    "OUT_OF_WINDOW",
+    "TRAIN_CONTAMINATION",
+}
 
 
-# ----------------------------
-# Shared helper functions
-# ----------------------------
+# ============================================================
+# Basic deterministic helpers
+# ============================================================
+
+def utf8(value):
+    return value.encode("utf-8")
+
 
 def compact_json(value):
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-
-
-def utf8_key(value):
-    return str(value).encode("utf-8")
-
-
-def utf8_sort(values):
-    return sorted(values, key=utf8_key)
-
-
-def sorted_codes(codes):
-    return sorted(set(codes), key=utf8_key)
-
-
-def safe_int(value, nonnegative=False, positive=False):
-    if isinstance(value, bool) or not isinstance(value, int):
-        return False
-    if abs(value) > SAFE_MAX:
-        return False
-    if positive:
-        return value > 0
-    if nonnegative:
-        return value >= 0
-    return True
-
-
-def finite_number(value):
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":")
     )
 
 
-def parse_timestamp(value):
-    """Strict timestamp validation and UTC conversion."""
-    if not isinstance(value, str):
-        return None
-
-    match = TS_RE.fullmatch(value)
-    if not match:
-        return None
-
-    year, month, day, hour, minute, second, fraction, offset = match.groups()
-
-    if offset != "Z":
-        offset_hour = int(offset[1:3])
-        offset_minute = int(offset[4:6])
-
-        if offset_hour > 14 or offset_minute > 59:
-            return None
-        if offset_hour == 14 and offset_minute != 0:
-            return None
-
-    try:
-        normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
-        return datetime.fromisoformat(normalized).astimezone(timezone.utc)
-    except ValueError:
-        return None
+def sorted_codes(codes):
+    return sorted(set(codes), key=utf8)
 
 
-def utc_milliseconds(dt):
-    return dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+# ============================================================
+# URI validation
+# ============================================================
+
+URI_PATTERN = re.compile(
+    r"^gs://[^/]+/.+$"
+)
 
 
-# ----------------------------
-# CRC32C implementation (Q1)
-# ----------------------------
-
-CRC32C_TABLE = []
+def valid_uri(value):
+    return isinstance(value, str) and URI_PATTERN.fullmatch(value) is not None
 
 
-def build_crc32c_table():
-    poly = 0x82F63B78
+# ============================================================
+# Generation validation
+# ============================================================
 
-    for i in range(256):
-        crc = i
-        for _ in range(8):
-            crc = (crc >> 1) ^ poly if (crc & 1) else crc >> 1
-        CRC32C_TABLE.append(crc & 0xFFFFFFFF)
+GENERATION_PATTERN = re.compile(r"^[0-9]+$")
 
 
-build_crc32c_table()
+def valid_generation(value):
+    return (
+        isinstance(value, str)
+        and GENERATION_PATTERN.fullmatch(value) is not None
+    )
+
+
+# ============================================================
+# CRC32C - Castagnoli
+# ============================================================
+
+CRC32C_PATTERN = re.compile(r"^[0-9a-f]{8}$")
+
+
+def valid_crc32c_syntax(value):
+    return (
+        isinstance(value, str)
+        and CRC32C_PATTERN.fullmatch(value) is not None
+    )
 
 
 def crc32c(data):
+    """
+    CRC-32C / Castagnoli.
+    Polynomial in reversed form: 0x82F63B78
+    """
+
     crc = 0xFFFFFFFF
 
     for byte in data:
-        crc = CRC32C_TABLE[(crc ^ byte) & 0xFF] ^ (crc >> 8)
+        crc ^= byte
 
-    return f"{(crc ^ 0xFFFFFFFF) & 0xFFFFFFFF:08x}"
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ 0x82F63B78
+            else:
+                crc >>= 1
+
+    crc ^= 0xFFFFFFFF
+
+    return f"{crc:08x}"
 
 
 # ============================================================
-# Q1: Build Immutable, Leakage-Safe Training Corpus
+# Timestamp validation and canonicalization
 # ============================================================
 
-def canonical_text(value):
+TIMESTAMP_PATTERN = re.compile(
+    r"^"
+    r"(\d{4})-(\d{2})-(\d{2})"
+    r"T"
+    r"(\d{2}):(\d{2}):(\d{2})"
+    r"(?:\.(\d{1,3}))?"
+    r"(Z|[+-]\d{2}:\d{2})"
+    r"$"
+)
+
+
+def parse_timestamp(value):
+    """
+    Strictly accepts:
+
+    YYYY-MM-DDTHH:mm:ssZ
+    YYYY-MM-DDTHH:mm:ss.sZ
+    YYYY-MM-DDTHH:mm:ss.ssZ
+    YYYY-MM-DDTHH:mm:ss.sssZ
+
+    or the same with ±HH:mm.
+
+    Offset magnitude <= 14:00.
+    If hour is 14, minutes must be 00.
+    """
+
+    if not isinstance(value, str):
+        raise ValueError("timestamp must be a string")
+
+    match = TIMESTAMP_PATTERN.fullmatch(value)
+
+    if not match:
+        raise ValueError("invalid timestamp syntax")
+
+    year = int(match.group(1))
+    month = int(match.group(2))
+    day = int(match.group(3))
+    hour = int(match.group(4))
+    minute = int(match.group(5))
+    second = int(match.group(6))
+    fraction = match.group(7)
+    offset = match.group(8)
+
+    # Validate calendar/time values.
+    if not (0 <= hour <= 23):
+        raise ValueError("invalid hour")
+
+    if not (0 <= minute <= 59):
+        raise ValueError("invalid minute")
+
+    if not (0 <= second <= 59):
+        raise ValueError("invalid second")
+
+    # Validate calendar date.
+    try:
+        datetime(year, month, day)
+    except ValueError:
+        raise ValueError("invalid calendar date")
+
+    # Fraction -> exactly milliseconds.
+    if fraction is None:
+        milliseconds = 0
+    elif len(fraction) == 1:
+        milliseconds = int(fraction) * 100
+    elif len(fraction) == 2:
+        milliseconds = int(fraction) * 10
+    else:
+        milliseconds = int(fraction)
+
+    # Timezone.
+    if offset == "Z":
+        tz = timezone.utc
+    else:
+        sign = 1 if offset[0] == "+" else -1
+
+        offset_hour = int(offset[1:3])
+        offset_minute = int(offset[4:6])
+
+        if offset_minute > 59:
+            raise ValueError("invalid offset minute")
+
+        # Maximum magnitude is 14:00.
+        if offset_hour > 14:
+            raise ValueError("offset too large")
+
+        if offset_hour == 14 and offset_minute != 0:
+            raise ValueError("14 hour offset must have 00 minutes")
+
+        total_minutes = sign * (
+            offset_hour * 60 + offset_minute
+        )
+
+        from datetime import timedelta
+
+        tz = timezone(timedelta(minutes=total_minutes))
+
+    dt = datetime(
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        milliseconds * 1000,
+        tzinfo=tz
+    )
+
+    dt = dt.astimezone(timezone.utc)
+
+    return dt
+
+
+def canonical_timestamp(value):
+    dt = parse_timestamp(value)
+
+    return (
+        dt.strftime("%Y-%m-%dT%H:%M:%S")
+        + f".{dt.microsecond // 1000:03d}Z"
+    )
+
+
+# ============================================================
+# Text canonicalization
+# ============================================================
+
+def canonicalize_text(value):
+    """
+    NFKC
+    -> lowercase
+    -> trim
+    -> collapse Unicode whitespace to ASCII space
+    """
+
     value = unicodedata.normalize("NFKC", value)
-    value = value.lower().strip()
-    return " ".join(value.split())
+    value = value.lower()
+
+    # Unicode whitespace.
+    chars = []
+    previous_space = False
+
+    for ch in value:
+        if ch.isspace():
+            if not previous_space:
+                chars.append(" ")
+            previous_space = True
+        else:
+            chars.append(ch)
+            previous_space = False
+
+    return "".join(chars).strip()
+
+
+# ============================================================
+# Unicode letter/number word-set
+# ============================================================
+
+def is_letter_or_number(ch):
+    category = unicodedata.category(ch)
+
+    return (
+        category.startswith("L")
+        or category.startswith("N")
+    )
 
 
 def word_set(text):
     """
-    Unicode letter/number word set.
-    Characters that are neither letters nor numbers delimit words.
+    Lowercase Unicode letter/number word-set.
+
+    A word is a maximal consecutive sequence of
+    Unicode letters and/or numbers.
     """
+
+    text = text.lower()
+
     words = []
     current = []
 
-    for ch in text.lower():
-        category = unicodedata.category(ch)
-        if category[0] in ("L", "N"):
+    for ch in text:
+        if is_letter_or_number(ch):
             current.append(ch)
         else:
             if current:
@@ -161,882 +313,1974 @@ def word_set(text):
     return set(words)
 
 
-def jaccard_similarity(a, b):
+def jaccard(a, b):
     if not a and not b:
         return 1.0
 
     union = a | b
+
+    if not union:
+        return 1.0
+
     return len(a & b) / len(union)
 
 
-def valid_jsonl_row(row):
-    expected = {"id", "entity", "eventTime", "revision", "text"}
+# ============================================================
+# Policy validation
+# ============================================================
 
-    if not isinstance(row, dict) or set(row.keys()) != expected:
+def validate_policy(policy):
+    if not isinstance(policy, dict):
+        return False, None, None, None
+
+    if "minTime" not in policy:
+        return False, None, None, None
+
+    if "maxTime" not in policy:
+        return False, None, None, None
+
+    if "contaminationThreshold" not in policy:
+        return False, None, None, None
+
+    try:
+        min_dt = parse_timestamp(policy["minTime"])
+        max_dt = parse_timestamp(policy["maxTime"])
+    except Exception:
+        return False, None, None, None
+
+    threshold = policy["contaminationThreshold"]
+
+    # bool is an int subclass, so explicitly reject it.
+    if isinstance(threshold, bool):
+        return False, None, None, None
+
+    if not isinstance(threshold, (int, float)):
+        return False, None, None, None
+
+    if not math.isfinite(float(threshold)):
+        return False, None, None, None
+
+    if threshold < 0 or threshold > 1:
+        return False, None, None, None
+
+    if min_dt > max_dt:
+        return False, None, None, None
+
+    return True, min_dt, max_dt, float(threshold)
+
+
+# ============================================================
+# JSONL row parsing
+# ============================================================
+
+EXPECTED_ROW_KEYS = {
+    "id",
+    "entity",
+    "eventTime",
+    "revision",
+    "text",
+}
+
+
+def valid_safe_revision(value):
+    """
+    Non-negative safe integer.
+    JS safe integer maximum = 2^53 - 1.
+    """
+
+    if isinstance(value, bool):
         return False
 
-    if not all(isinstance(row[field], str) for field in ("id", "entity", "eventTime", "text")):
+    if not isinstance(value, int):
         return False
 
-    if not safe_int(row["revision"], nonnegative=True):
-        return False
-
-    return parse_timestamp(row["eventTime"]) is not None
+    return 0 <= value <= (2**53 - 1)
 
 
 def parse_jsonl(content):
     """
-    Returns (rows, schema_invalid, jsonl_invalid).
-    Blank lines are ignored.
+    Returns:
+        rows,
+        has_json_error,
+        has_schema_error,
+        has_any_nonblank_line
     """
-    rows = []
-    schema_invalid = False
-    jsonl_invalid = False
 
+    rows = []
+    has_json_error = False
+    has_schema_error = False
+    has_any_nonblank_line = False
+
+    # splitlines() handles normal newline variants.
     for line in content.splitlines():
+
         if line.strip() == "":
             continue
 
+        has_any_nonblank_line = True
+
         try:
-            item = json.loads(line)
+            parsed = json.loads(line)
         except Exception:
-            jsonl_invalid = True
+            has_json_error = True
             continue
 
-        if not valid_jsonl_row(item):
-            schema_invalid = True
-        else:
-            rows.append(item)
+        # Every parsed line must be an object.
+        if not isinstance(parsed, dict):
+            has_schema_error = True
+            continue
 
-    if not rows and not jsonl_invalid:
-        schema_invalid = True
+        # EXACTLY these five keys.
+        if set(parsed.keys()) != EXPECTED_ROW_KEYS:
+            has_schema_error = True
+            continue
 
-    return rows, schema_invalid, jsonl_invalid
+        # Four text fields must be strings.
+        if not isinstance(parsed["id"], str):
+            has_schema_error = True
+            continue
 
+        if not isinstance(parsed["entity"], str):
+            has_schema_error = True
+            continue
 
-def empty_corpus_response():
-    empty_hash = hashlib.sha256(b"").hexdigest()
+        if not isinstance(parsed["eventTime"], str):
+            has_schema_error = True
+            continue
 
-    return {
-        "splits": {
-            "train": [],
-            "validation": [],
-            "test": []
-        },
-        "rejectedObjects": [],
-        "rejectedRows": [],
-        "digests": {
-            "train": empty_hash,
-            "validation": empty_hash,
-            "test": empty_hash
-        },
-        "lineage": []
-    }
+        if not isinstance(parsed["text"], str):
+            has_schema_error = True
+            continue
 
+        # Revision must be non-negative safe integer.
+        if not valid_safe_revision(parsed["revision"]):
+            has_schema_error = True
+            continue
 
-def valid_policy(policy):
-    if not isinstance(policy, dict):
-        return None
+        # eventTime must be valid.
+        try:
+            event_time = canonical_timestamp(parsed["eventTime"])
+        except Exception:
+            has_schema_error = True
+            continue
 
-    if set(policy.keys()) != {
-        "minTime",
-        "maxTime",
-        "contaminationThreshold"
-    }:
-        return None
+        rows.append({
+            "id": parsed["id"],
+            "entity": parsed["entity"],
+            "eventTime": event_time,
+            "revision": parsed["revision"],
+            "text": parsed["text"],
+        })
 
-    min_time = parse_timestamp(policy["minTime"])
-    max_time = parse_timestamp(policy["maxTime"])
-    threshold = policy["contaminationThreshold"]
+    # Empty/blank-only file.
+    if not has_any_nonblank_line:
+        has_schema_error = True
 
-    if min_time is None or max_time is None:
-        return None
-
-    if min_time > max_time:
-        return None
-
-    if not finite_number(threshold) or not 0 <= threshold <= 1:
-        return None
-
-    return min_time, max_time, threshold
-
-
-def canonicalize_row(row):
-    dt = parse_timestamp(row["eventTime"])
-
-    return {
-        "id": row["id"],
-        "entity": canonical_text(row["entity"]),
-        "eventTime": utc_milliseconds(dt),
-        "revision": row["revision"],
-        "text": canonical_text(row["text"])
-    }
+    return (
+        rows,
+        has_json_error,
+        has_schema_error,
+        has_any_nonblank_line
+    )
 
 
-def row_json_for_sort(row):
-    return compact_json({
-        "id": row["id"],
-        "entity": row["entity"],
-        "eventTime": row["eventTime"],
-        "revision": row["revision"],
-        "text": row["text"]
-    })
+# ============================================================
+# Object processing
+# ============================================================
 
+def process_object(obj):
+    """
+    Returns:
 
-def split_digest(rows):
-    blob = "".join(row_json_for_sort(row) + "\n" for row in rows)
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+        accepted_object or None
+        rejected_object
+    """
 
-
-@app.post("/build-corpus")
-def build_corpus():
-    data = request.get_json(silent=True)
-
-    # Required HTTP 400 condition
-    if (
-        not isinstance(data, dict)
-        or "policy" not in data
-        or not isinstance(data.get("objects"), list)
-    ):
-        return jsonify({"error": "INVALID_INPUT"}), 400
-
-    response = empty_corpus_response()
-    policy_info = valid_policy(data.get("policy"))
-
-    all_valid_rows = []
-
-    # Validate each supplied object independently
-    for obj in data["objects"]:
-        codes = []
-        uri = obj.get("uri") if isinstance(obj, dict) and isinstance(obj.get("uri"), str) else None
-
-        if not isinstance(obj, dict):
-            response["rejectedObjects"].append({
+    # Non-object supplied.
+    if not isinstance(obj, dict):
+        return (
+            None,
+            {
                 "uri": None,
-                "reasonCodes": ["URI_INVALID", "GENERATION_INVALID", "SCHEMA_INVALID"]
-            })
-            continue
-
-        object_uri = obj.get("uri")
-
-        if not isinstance(object_uri, str) or not URI_RE.fullmatch(object_uri):
-            codes.append("URI_INVALID")
-
-        generation = obj.get("generation")
-        fetched_generation = obj.get("fetchedGeneration")
-
-        generation_valid = isinstance(generation, str) and GEN_RE.fullmatch(generation)
-        fetched_valid = (
-            isinstance(fetched_generation, str)
-            and GEN_RE.fullmatch(fetched_generation)
+                "reasonCodes": ["SCHEMA_INVALID"]
+            }
         )
 
-        if not generation_valid or not fetched_valid:
-            codes.append("GENERATION_INVALID")
+    reasons = []
 
-        if generation != fetched_generation:
-            codes.append("GENERATION_MISMATCH")
+    # --------------------------------------------------------
+    # URI
+    # --------------------------------------------------------
 
-        provided_crc = obj.get("crc32c")
-        content = obj.get("content")
+    uri = obj.get("uri")
 
-        crc_valid = isinstance(provided_crc, str) and HEX8_RE.fullmatch(provided_crc)
+    if not valid_uri(uri):
+        reasons.append("URI_INVALID")
 
-        if not crc_valid:
-            codes.append("CRC32C_INVALID")
+    # --------------------------------------------------------
+    # Generation
+    # --------------------------------------------------------
 
-        if isinstance(content, str) and crc_valid:
-            actual_crc = crc32c(content.encode("utf-8"))
-            if actual_crc != provided_crc:
-                codes.append("CRC32C_MISMATCH")
+    generation = obj.get("generation")
+    fetched_generation = obj.get("fetchedGeneration")
 
-        schema_id = obj.get("schemaId")
-        if schema_id != "training-v1":
-            codes.append("SCHEMA_INVALID")
+    generation_valid = valid_generation(generation)
+    fetched_generation_valid = valid_generation(fetched_generation)
 
-        parsed_rows = []
-        if not isinstance(content, str):
-            codes.append("SCHEMA_INVALID")
-        else:
-            parsed_rows, schema_invalid, jsonl_invalid = parse_jsonl(content)
+    if not generation_valid or not fetched_generation_valid:
+        reasons.append("GENERATION_INVALID")
 
-            if schema_invalid:
-                codes.append("SCHEMA_INVALID")
-            if jsonl_invalid:
-                codes.append("JSONL_INVALID")
+    # Unequal supplied generation values.
+    if (
+        "generation" in obj
+        and "fetchedGeneration" in obj
+        and generation != fetched_generation
+    ):
+        reasons.append("GENERATION_MISMATCH")
 
-        if codes:
-            response["rejectedObjects"].append({
-                "uri": uri,
-                "reasonCodes": sorted_codes(codes)
-            })
-            continue
+    # --------------------------------------------------------
+    # CRC32C
+    # --------------------------------------------------------
 
-        lineage_entry = {
-            "uri": object_uri,
+    crc_value = obj.get("crc32c")
+
+    crc_valid = valid_crc32c_syntax(crc_value)
+
+    if not crc_valid:
+        reasons.append("CRC32C_INVALID")
+
+    # --------------------------------------------------------
+    # Schema ID
+    # --------------------------------------------------------
+
+    if obj.get("schemaId") != "training-v1":
+        reasons.append("SCHEMA_INVALID")
+
+    # --------------------------------------------------------
+    # Content
+    # --------------------------------------------------------
+
+    content = obj.get("content")
+
+    if not isinstance(content, str):
+        reasons.append("SCHEMA_INVALID")
+
+        # IMPORTANT:
+        # CRC32C_MISMATCH is NOT checked unless content is
+        # a string and CRC syntax is valid.
+    elif crc_valid:
+        calculated_crc = crc32c(content.encode("utf-8"))
+
+        if calculated_crc != crc_value:
+            reasons.append("CRC32C_MISMATCH")
+
+    # --------------------------------------------------------
+    # JSONL
+    # --------------------------------------------------------
+
+    rows = []
+
+    if isinstance(content, str):
+        (
+            rows,
+            has_json_error,
+            has_schema_error,
+            _
+        ) = parse_jsonl(content)
+
+        if has_json_error:
+            reasons.append("JSONL_INVALID")
+
+        if has_schema_error:
+            reasons.append("SCHEMA_INVALID")
+
+    # --------------------------------------------------------
+    # Accepted/rejected
+    # --------------------------------------------------------
+
+    reasons = sorted_codes(reasons)
+
+    if reasons:
+        return (
+            None,
+            {
+                "uri": uri if isinstance(uri, str) else None,
+                "reasonCodes": reasons
+            }
+        )
+
+    return (
+        {
+            "uri": uri,
             "generation": generation,
-            "crc32c": provided_crc,
-            "schemaId": schema_id
-        }
-        response["lineage"].append(lineage_entry)
+            "crc32c": crc_value,
+            "schemaId": "training-v1",
+            "rows": rows,
+        },
+        None
+    )
 
-        for row in parsed_rows:
-            all_valid_rows.append(canonicalize_row(row))
 
-    # Deduplicate canonical rows
-    grouped = {}
+# ============================================================
+# Deterministic bucket
+# ============================================================
 
-    for row in all_valid_rows:
-        key = compact_json([row["entity"], row["eventTime"], row["text"]])
-        grouped.setdefault(key, []).append(row)
+def split_for_entity(entity):
+    digest = hashlib.sha256(
+        entity.encode("utf-8")
+    ).digest()
 
-    retained_rows = []
+    bucket = digest[0] % 10
 
-    for group_rows in grouped.values():
-        winner = sorted(
-            group_rows,
-            key=lambda r: (-r["revision"], utf8_key(r["id"]))
-        )[0]
+    if bucket <= 5:
+        return "train"
 
-        retained_rows.append(winner)
+    if bucket <= 7:
+        return "validation"
 
-        for loser in group_rows:
-            if loser is not winner:
-                response["rejectedRows"].append({
-                    "id": loser["id"],
-                    "reasonCodes": ["DUPLICATE"]
-                })
+    return "test"
 
-    # Invalid policy rejects every retained row
-    if policy_info is None:
-        for row in retained_rows:
-            response["rejectedRows"].append({
+
+# ============================================================
+# Main endpoint
+# ============================================================
+
+@app.route("/build-corpus", methods=["POST"])
+def build_corpus():
+
+    # --------------------------------------------------------
+    # Request parsing
+    # --------------------------------------------------------
+
+    if not request.is_json:
+        return app.response_class(
+            response='{"error":"INVALID_INPUT"}',
+            status=400,
+            mimetype="application/json"
+        )
+
+    try:
+        body = request.get_json()
+    except Exception:
+        return app.response_class(
+            response='{"error":"INVALID_INPUT"}',
+            status=400,
+            mimetype="application/json"
+        )
+
+    if not isinstance(body, dict):
+        return app.response_class(
+            response='{"error":"INVALID_INPUT"}',
+            status=400,
+            mimetype="application/json"
+        )
+
+    # Missing policy or non-array objects -> exactly 400.
+    if "policy" not in body:
+        return app.response_class(
+            response='{"error":"INVALID_INPUT"}',
+            status=400,
+            mimetype="application/json"
+        )
+
+    if "objects" not in body:
+        return app.response_class(
+            response='{"error":"INVALID_INPUT"}',
+            status=400,
+            mimetype="application/json"
+        )
+
+    if not isinstance(body["objects"], list):
+        return app.response_class(
+            response='{"error":"INVALID_INPUT"}',
+            status=400,
+            mimetype="application/json"
+        )
+
+    policy = body["policy"]
+    objects = body["objects"]
+
+    # --------------------------------------------------------
+    # Policy
+    # --------------------------------------------------------
+
+    (
+        policy_valid,
+        min_time,
+        max_time,
+        threshold
+    ) = validate_policy(policy)
+
+    # --------------------------------------------------------
+    # Validate objects
+    # --------------------------------------------------------
+
+    accepted_objects = []
+    rejected_objects = []
+
+    for obj in objects:
+
+        accepted, rejected = process_object(obj)
+
+        if rejected is not None:
+            rejected_objects.append(rejected)
+        else:
+            accepted_objects.append(accepted)
+
+    # --------------------------------------------------------
+    # Collect rows from accepted objects
+    # --------------------------------------------------------
+
+    candidates = []
+
+    for obj in accepted_objects:
+
+        for row in obj["rows"]:
+
+            # Canonicalize entity/text before deduplication.
+            entity = canonicalize_text(row["entity"])
+            text = canonicalize_text(row["text"])
+
+            canonical_row = {
+                "id": row["id"],
+                "entity": entity,
+                "eventTime": row["eventTime"],
+                "revision": row["revision"],
+                "text": text,
+            }
+
+            candidates.append(canonical_row)
+
+    # --------------------------------------------------------
+    # Deduplication
+    #
+    # Key:
+    # [entity,eventTime,text]
+    #
+    # Highest revision wins.
+    # Tie -> UTF-8-smallest ID.
+    # --------------------------------------------------------
+
+    groups = {}
+
+    for row in candidates:
+
+        key = (
+            row["entity"],
+            row["eventTime"],
+            row["text"]
+        )
+
+        groups.setdefault(key, []).append(row)
+
+    retained = []
+    rejected_rows = []
+
+    for group in groups.values():
+
+        group.sort(
+            key=lambda row: (
+                -row["revision"],
+                utf8(row["id"])
+            )
+        )
+
+        winner = group[0]
+        retained.append(winner)
+
+        for loser in group[1:]:
+            rejected_rows.append({
+                "id": loser["id"],
+                "reasonCodes": ["DUPLICATE"]
+            })
+
+    # --------------------------------------------------------
+    # Policy / time filtering
+    # --------------------------------------------------------
+
+    policy_retained = []
+
+    for row in retained:
+
+        if not policy_valid:
+
+            rejected_rows.append({
                 "id": row["id"],
                 "reasonCodes": ["POLICY_INVALID"]
             })
 
-        retained_rows = []
+            continue
 
-    else:
-        min_time, max_time, threshold = policy_info
-        window_rows = []
+        event_dt = parse_timestamp(row["eventTime"])
 
-        for row in retained_rows:
-            event_dt = parse_timestamp(row["eventTime"])
+        if event_dt < min_time or event_dt > max_time:
 
-            if event_dt < min_time or event_dt > max_time:
-                response["rejectedRows"].append({
-                    "id": row["id"],
-                    "reasonCodes": ["OUT_OF_WINDOW"]
-                })
-            else:
-                window_rows.append(row)
+            rejected_rows.append({
+                "id": row["id"],
+                "reasonCodes": ["OUT_OF_WINDOW"]
+            })
 
-        retained_rows = window_rows
+            continue
 
-        # Deterministic split based on SHA256 first byte
-        provisional_splits = {
-            "train": [],
-            "validation": [],
-            "test": []
-        }
+        policy_retained.append(row)
 
-        for row in retained_rows:
-            bucket = hashlib.sha256(
-                row["entity"].encode("utf-8")
-            ).digest()[0] % 10
+    # --------------------------------------------------------
+    # Split
+    # --------------------------------------------------------
 
-            if bucket <= 5:
-                provisional_splits["train"].append(row)
-            elif bucket <= 7:
-                provisional_splits["validation"].append(row)
-            else:
-                provisional_splits["test"].append(row)
+    train = []
+    validation = []
+    test = []
 
-        train_word_sets = [
-            word_set(row["text"])
-            for row in provisional_splits["train"]
-        ]
+    for row in policy_retained:
 
-        # Keep all train rows. Remove contaminated validation/test rows.
-        response["splits"]["train"] = provisional_splits["train"]
+        split = split_for_entity(row["entity"])
 
-        for split_name in ("validation", "test"):
-            for row in provisional_splits[split_name]:
-                candidate_words = word_set(row["text"])
+        if split == "train":
+            train.append(row)
+        elif split == "validation":
+            validation.append(row)
+        else:
+            test.append(row)
 
-                contaminated = any(
-                    jaccard_similarity(candidate_words, train_words) >= threshold
-                    for train_words in train_word_sets
+    # --------------------------------------------------------
+    # Train contamination
+    # --------------------------------------------------------
+
+    train_word_sets = [
+        word_set(row["text"])
+        for row in train
+    ]
+
+    def contamination_filter(rows):
+
+        kept = []
+
+        for row in rows:
+
+            row_words = word_set(row["text"])
+
+            contaminated = False
+
+            for train_words in train_word_sets:
+
+                similarity = jaccard(
+                    row_words,
+                    train_words
                 )
 
-                if contaminated:
-                    response["rejectedRows"].append({
-                        "id": row["id"],
-                        "reasonCodes": ["TRAIN_CONTAMINATION"]
-                    })
-                else:
-                    response["splits"][split_name].append(row)
+                if similarity >= threshold:
+                    contaminated = True
+                    break
 
-    # Required deterministic split ordering
-    for split_name in ("train", "validation", "test"):
-        response["splits"][split_name] = sorted(
-            response["splits"][split_name],
-            key=lambda r: (utf8_key(r["id"]), row_json_for_sort(r).encode("utf-8"))
+            if contaminated:
+
+                rejected_rows.append({
+                    "id": row["id"],
+                    "reasonCodes": ["TRAIN_CONTAMINATION"]
+                })
+
+            else:
+                kept.append(row)
+
+        return kept
+
+    validation = contamination_filter(validation)
+    test = contamination_filter(test)
+
+    # --------------------------------------------------------
+    # Deterministic row sorting
+    # --------------------------------------------------------
+
+    def sort_rows(rows):
+        return sorted(
+            rows,
+            key=lambda row: (
+                utf8(row["id"]),
+                utf8(compact_json(row))
+            )
         )
 
-    # Deterministic rejection/lineage ordering
-    response["rejectedObjects"] = sorted(
-        response["rejectedObjects"],
-        key=lambda x: (
-            utf8_key(x["uri"]) if isinstance(x["uri"], str) else b"",
-            compact_json(x).encode("utf-8")
-        )
-    )
+    train = sort_rows(train)
+    validation = sort_rows(validation)
+    test = sort_rows(test)
 
-    response["rejectedRows"] = sorted(
-        response["rejectedRows"],
-        key=lambda x: (
-            utf8_key(x["id"]),
-            compact_json(x).encode("utf-8")
-        )
-    )
+    # --------------------------------------------------------
+    # Exact JSONL serialization and SHA-256
+    # --------------------------------------------------------
 
-    response["lineage"] = sorted(
-        response["lineage"],
-        key=lambda x: (
-            utf8_key(x["uri"]),
-            compact_json(x).encode("utf-8")
-        )
-    )
+    def split_digest(rows):
 
-    for item in response["rejectedObjects"]:
-        item["reasonCodes"] = sorted_codes(item["reasonCodes"])
+        if not rows:
+            data = b""
+        else:
+            lines = [
+                compact_json({
+                    "id": row["id"],
+                    "entity": row["entity"],
+                    "eventTime": row["eventTime"],
+                    "revision": row["revision"],
+                    "text": row["text"],
+                })
+                for row in rows
+            ]
 
-    for item in response["rejectedRows"]:
-        item["reasonCodes"] = sorted_codes(item["reasonCodes"])
+            data = (
+                "\n".join(lines) + "\n"
+            ).encode("utf-8")
 
-    response["digests"] = {
-        "train": split_digest(response["splits"]["train"]),
-        "validation": split_digest(response["splits"]["validation"]),
-        "test": split_digest(response["splits"]["test"])
+        return hashlib.sha256(data).hexdigest()
+
+    digests = {
+        "train": split_digest(train),
+        "validation": split_digest(validation),
+        "test": split_digest(test),
     }
 
-    return jsonify(response), 200
+    # --------------------------------------------------------
+    # Rejected rows:
+    # merge same ID and sort reason codes.
+    # --------------------------------------------------------
 
+    rejected_by_id = {}
 
-# ============================================================
-# Q2: Leakage-Safe BigQuery ML Experiment
-# ============================================================
+    for item in rejected_rows:
 
-def valid_run_id(run_id):
-    return isinstance(run_id, str) and 1 <= len(run_id) <= 128
+        row_id = item["id"]
 
+        if row_id not in rejected_by_id:
+            rejected_by_id[row_id] = set()
 
-def invalid_select_response(run_id):
-    return {
-        "runId": run_id if isinstance(run_id, str) else None,
-        "selectedTrialId": None,
-        "trainRowIds": [],
-        "evalRowIds": [],
-        "featureNames": [],
-        "datasetDigest": None,
-        "reasonCodes": ["INVALID_INPUT"]
-    }
+        for code in item["reasonCodes"]:
+            rejected_by_id[row_id].add(code)
 
-
-def valid_selection(data):
-    expected = {
-        "phase",
-        "runId",
-        "forbiddenFeatures",
-        "numTrialsLimit",
-        "rows",
-        "trials"
-    }
-
-    if not isinstance(data, dict) or set(data.keys()) != expected:
-        return False
-
-    if data["phase"] != "select" or not valid_run_id(data["runId"]):
-        return False
-
-    if not isinstance(data["forbiddenFeatures"], list):
-        return False
-
-    if any(not isinstance(name, str) for name in data["forbiddenFeatures"]):
-        return False
-
-    if not safe_int(data["numTrialsLimit"], positive=True):
-        return False
-
-    if not isinstance(data["rows"], list) or len(data["rows"]) == 0:
-        return False
-
-    if not isinstance(data["trials"], list):
-        return False
-
-    row_ids = set()
-
-    for row in data["rows"]:
-        required_row = {
-            "id",
-            "entity",
-            "eventTime",
-            "predictionTime",
-            "version",
-            "split",
-            "features"
+    rejected_rows_final = [
+        {
+            "id": row_id,
+            "reasonCodes": sorted_codes(codes)
         }
+        for row_id, codes in rejected_by_id.items()
+    ]
 
-        if not isinstance(row, dict) or set(row.keys()) != required_row:
+    rejected_rows_final.sort(
+        key=lambda item: (
+            utf8(item["id"]),
+            utf8(compact_json(item))
+        )
+    )
+
+    # --------------------------------------------------------
+    # Rejected object sorting
+    # --------------------------------------------------------
+
+    rejected_objects.sort(
+        key=lambda item: (
+            utf8(item["uri"]) if isinstance(item["uri"], str)
+            else b"",
+            utf8(compact_json(item))
+        )
+    )
+
+    # --------------------------------------------------------
+    # Lineage
+    # --------------------------------------------------------
+
+    lineage = []
+
+    for obj in accepted_objects:
+
+        lineage.append({
+            "uri": obj["uri"],
+            "generation": obj["generation"],
+            "crc32c": obj["crc32c"],
+            "schemaId": obj["schemaId"],
+        })
+
+    lineage.sort(
+        key=lambda item: (
+            utf8(item["uri"]),
+            utf8(compact_json(item))
+        )
+    )
+
+    # --------------------------------------------------------
+    # Final response
+    # --------------------------------------------------------
+
+    response = {
+        "splits": {
+            "train": train,
+            "validation": validation,
+            "test": test,
+        },
+        "rejectedObjects": rejected_objects,
+        "rejectedRows": rejected_rows_final,
+        "digests": digests,
+        "lineage": lineage,
+    }
+
+    return app.response_class(
+        response=compact_json(response),
+        status=200,
+        mimetype="application/json"
+    )
+
+
+
+# ============================================================
+# Q2 - Leakage-Safe BigQuery ML Experiment
+# ============================================================
+
+BQML_RUNS = {}
+BQML_LOCK = threading.Lock()
+BQML_SAFE_MAX = 2**53 - 1
+
+
+def bqml_safe_integer(value):
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= BQML_SAFE_MAX
+    )
+
+
+def bqml_finite(value):
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
+
+
+def bqml_unit(value):
+    return bqml_finite(value) and 0 <= float(value) <= 1
+
+
+def bqml_digest(value):
+    return (
+        isinstance(value, str)
+        and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+    )
+
+
+def bqml_row_valid(row):
+    if not isinstance(row, dict):
+        return False
+
+    if set(row) != {
+        "id", "entity", "eventTime", "predictionTime",
+        "version", "split", "features"
+    }:
+        return False
+
+    if not isinstance(row["id"], str):
+        return False
+    if not isinstance(row["entity"], str):
+        return False
+    if not isinstance(row["eventTime"], str):
+        return False
+    if not isinstance(row["predictionTime"], str):
+        return False
+    if not bqml_safe_integer(row["version"]):
+        return False
+    if row["split"] not in ("TRAIN", "EVAL"):
+        return False
+    if not isinstance(row["features"], dict):
+        return False
+
+    try:
+        parse_timestamp(row["eventTime"])
+        parse_timestamp(row["predictionTime"])
+    except Exception:
+        return False
+
+    for name, feature in row["features"].items():
+        if not isinstance(name, str):
             return False
-
-        if not isinstance(row["id"], str) or row["id"] in row_ids:
+        if not isinstance(feature, dict):
             return False
-        row_ids.add(row["id"])
-
-        if not isinstance(row["entity"], str):
+        if set(feature) != {"value", "availableAt"}:
             return False
-
-        if parse_timestamp(row["eventTime"]) is None:
+        # value is opaque JSON data. Do not execute or interpret it.
+        if not isinstance(feature["availableAt"], str):
             return False
-
-        if parse_timestamp(row["predictionTime"]) is None:
-            return False
-
-        if not safe_int(row["version"], nonnegative=True):
-            return False
-
-        if row["split"] not in ("TRAIN", "EVAL"):
-            return False
-
-        if not isinstance(row["features"], dict):
-            return False
-
-        for feature_name, feature_data in row["features"].items():
-            if not isinstance(feature_name, str):
-                return False
-
-            if not isinstance(feature_data, dict):
-                return False
-
-            if set(feature_data.keys()) != {"value", "availableAt"}:
-                return False
-
-            if parse_timestamp(feature_data["availableAt"]) is None:
-                return False
-
-    trial_ids = set()
-
-    for trial in data["trials"]:
-        if not isinstance(trial, dict):
-            return False
-
-        if set(trial.keys()) != {"trialId", "status", "evalMetric"}:
-            return False
-
-        if not safe_int(trial["trialId"], nonnegative=True):
-            return False
-
-        if trial["trialId"] in trial_ids:
-            return False
-        trial_ids.add(trial["trialId"])
-
-        if trial["status"] not in ("SUCCEEDED", "FAILED"):
+        try:
+            parse_timestamp(feature["availableAt"])
+        except Exception:
             return False
 
     return True
 
 
-def retained_selection_rows(rows):
-    """Deduplicate by [entity, UTC(eventTime)]."""
-    grouped = {}
-
+def bqml_deduplicate(rows):
+    groups = {}
     for row in rows:
-        event_time = utc_milliseconds(parse_timestamp(row["eventTime"]))
-        key = compact_json([row["entity"], event_time])
-        grouped.setdefault(key, []).append(row)
+        key = (row["entity"], parse_timestamp(row["eventTime"]))
+        groups.setdefault(key, []).append(row)
 
     retained = []
-
-    for candidates in grouped.values():
-        retained.append(
-            sorted(
-                candidates,
-                key=lambda row: (-row["version"], utf8_key(row["id"]))
-            )[0]
-        )
-
+    for group in groups.values():
+        retained.append(min(
+            group,
+            key=lambda r: (-r["version"], utf8(r["id"]))
+        ))
     return retained
 
 
-def eligible_features(rows, forbidden_features):
+def bqml_features(rows, forbidden):
     if not rows:
         return []
 
-    names = set(rows[0]["features"].keys())
-    forbidden = set(forbidden_features)
-
+    common = set(rows[0]["features"])
     for row in rows[1:]:
-        names &= set(row["features"].keys())
+        common.intersection_update(row["features"])
 
-    accepted = []
-
-    for name in names:
+    result = []
+    for name in common:
         if name in forbidden:
             continue
 
-        point_in_time_valid = True
-
+        safe_for_all = True
         for row in rows:
-            available_at = parse_timestamp(row["features"][name]["availableAt"])
-            prediction_time = parse_timestamp(row["predictionTime"])
-
-            if available_at > prediction_time:
-                point_in_time_valid = False
+            available = parse_timestamp(
+                row["features"][name]["availableAt"]
+            )
+            prediction = parse_timestamp(row["predictionTime"])
+            if available > prediction:
+                safe_for_all = False
                 break
 
-        if point_in_time_valid:
-            accepted.append(name)
+        if safe_for_all:
+            result.append(name)
 
-    return utf8_sort(accepted)
+    return sorted(result, key=utf8)
 
 
-def select_trial(data):
-    run_id = data.get("runId") if isinstance(data, dict) else None
-    canonical_request = compact_json(data)
+def bqml_trial_shape_valid(trial):
+    if not isinstance(trial, dict):
+        return False
+    if set(trial) != {"trialId", "status", "evalMetric"}:
+        return False
+    if not bqml_safe_integer(trial["trialId"]):
+        return False
+    if trial["status"] not in ("SUCCEEDED", "FAILED"):
+        return False
+    return True
 
-    # Exact replay / conflict handling
-    if valid_run_id(run_id) and run_id in RUNS:
-        if RUNS[run_id]["request"] == canonical_request:
-            return RUNS[run_id]["response"], 200
-        return {"error": "RUN_ID_CONFLICT"}, 409
 
-    if not valid_selection(data):
-        response = invalid_select_response(run_id)
-
-        if valid_run_id(run_id):
-            RUNS[run_id] = {
-                "request": canonical_request,
-                "response": deepcopy(response)
-            }
-
-        return response, 200
-
-    reason_codes = []
-
-    if len(data["trials"]) > data["numTrialsLimit"]:
-        reason_codes.append("TRIAL_LIMIT_EXCEEDED")
-
-    retained_rows = retained_selection_rows(data["rows"])
-
-    train_ids = utf8_sort([
-        row["id"]
-        for row in retained_rows
-        if row["split"] == "TRAIN"
-    ])
-
-    eval_ids = utf8_sort([
-        row["id"]
-        for row in retained_rows
-        if row["split"] == "EVAL"
-    ])
-
-    features = eligible_features(
-        retained_rows,
-        data["forbiddenFeatures"]
+def bqml_trial_eligible(trial):
+    return (
+        trial["status"] == "SUCCEEDED"
+        and bqml_finite(trial["evalMetric"])
     )
 
-    successful_trials = [
-        trial
-        for trial in data["trials"]
-        if trial["status"] == "SUCCEEDED"
-        and finite_number(trial["evalMetric"])
-    ]
 
-    if not successful_trials:
-        reason_codes.append("NO_SUCCESSFUL_TRIAL")
+def bqml_fingerprint(body):
+    # Canonical fingerprint for replay/conflict detection. Object
+    # member ordering is not semantically significant.
+    raw = json.dumps(
+        body,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
 
-    selected_trial = None
 
-    if not reason_codes:
-        selected_trial = sorted(
-            successful_trials,
-            key=lambda trial: (
-                -trial["evalMetric"],
-                trial["trialId"]
-            )
-        )[0]["trialId"]
-
-    digest_payload = {
-        "trainRowIds": train_ids,
-        "evalRowIds": eval_ids,
-        "featureNames": features
+def bqml_selection(body):
+    required = {
+        "phase", "runId", "forbiddenFeatures",
+        "numTrialsLimit", "rows", "trials"
     }
 
+    if not isinstance(body, dict) or set(body) != required:
+        return None, None
+
+    codes = []
+    run_id = body["runId"]
+
+    if not isinstance(run_id, str) or not run_id or len(run_id) > 128:
+        codes.append("INVALID_INPUT")
+
+    forbidden = body["forbiddenFeatures"]
+    if not isinstance(forbidden, list) or any(
+        not isinstance(x, str) for x in forbidden
+    ):
+        codes.append("INVALID_INPUT")
+        forbidden = []
+
+    limit = body["numTrialsLimit"]
+    if not bqml_safe_integer(limit) or limit <= 0:
+        codes.append("INVALID_INPUT")
+
+    rows = body["rows"]
+    if not isinstance(rows, list) or not rows:
+        codes.append("INVALID_INPUT")
+
+    trials = body["trials"]
+    if not isinstance(trials, list):
+        codes.append("INVALID_INPUT")
+        trials = []
+
+    valid_rows = []
+    seen_rows = set()
+    if isinstance(rows, list):
+        for row in rows:
+            if not bqml_row_valid(row):
+                codes.append("INVALID_INPUT")
+                continue
+            if row["id"] in seen_rows:
+                codes.append("INVALID_INPUT")
+                continue
+            seen_rows.add(row["id"])
+            valid_rows.append(row)
+
+    eligible_trials = []
+    seen_trials = set()
+    for trial in trials:
+        if not bqml_trial_shape_valid(trial):
+            codes.append("INVALID_INPUT")
+            continue
+        if trial["trialId"] in seen_trials:
+            codes.append("INVALID_INPUT")
+            continue
+        seen_trials.add(trial["trialId"])
+        if bqml_trial_eligible(trial):
+            eligible_trials.append(trial)
+
+    if bqml_safe_integer(limit) and len(trials) > limit:
+        codes.append("TRIAL_LIMIT_EXCEEDED")
+
+    codes = sorted_codes(codes)
+    fingerprint = bqml_fingerprint(body)
+
+    if codes:
+        return ({
+            "runId": run_id if isinstance(run_id, str) else None,
+            "selectedTrialId": None,
+            "trainRowIds": [],
+            "evalRowIds": [],
+            "featureNames": [],
+            "datasetDigest": None,
+            "reasonCodes": codes
+        }, fingerprint)
+
+    if not eligible_trials:
+        return ({
+            "runId": run_id,
+            "selectedTrialId": None,
+            "trainRowIds": [],
+            "evalRowIds": [],
+            "featureNames": [],
+            "datasetDigest": None,
+            "reasonCodes": ["NO_SUCCESSFUL_TRIAL"]
+        }, fingerprint)
+
+    retained = bqml_deduplicate(valid_rows)
+
+    feature_names = bqml_features(retained, set(forbidden))
+    train_ids = sorted(
+        [r["id"] for r in retained if r["split"] == "TRAIN"],
+        key=utf8
+    )
+    eval_ids = sorted(
+        [r["id"] for r in retained if r["split"] == "EVAL"],
+        key=utf8
+    )
+
+    selected = min(
+        eligible_trials,
+        key=lambda t: (-float(t["evalMetric"]), t["trialId"])
+    )
+
+    digest_object = {
+        "trainRowIds": train_ids,
+        "evalRowIds": eval_ids,
+        "featureNames": feature_names
+    }
     dataset_digest = hashlib.sha256(
-        compact_json(digest_payload).encode("utf-8")
+        compact_json(digest_object).encode("utf-8")
     ).hexdigest()
 
     response = {
-        "runId": data["runId"],
-        "selectedTrialId": selected_trial,
+        "runId": run_id,
+        "selectedTrialId": selected["trialId"],
         "trainRowIds": train_ids,
         "evalRowIds": eval_ids,
-        "featureNames": features,
+        "featureNames": feature_names,
         "datasetDigest": dataset_digest,
-        "reasonCodes": sorted_codes(reason_codes)
+        "reasonCodes": []
+    }
+    return response, fingerprint
+
+
+def bqml_test_row_valid(row):
+    if not isinstance(row, dict):
+        return False
+    if set(row) != {"label", "prediction", "slice"}:
+        return False
+    if (
+        isinstance(row["label"], bool)
+        or not isinstance(row["label"], int)
+        or row["label"] not in (0, 1)
+    ):
+        return False
+    if (
+        isinstance(row["prediction"], bool)
+        or not isinstance(row["prediction"], int)
+        or row["prediction"] not in (0, 1)
+    ):
+        return False
+    if not isinstance(row["slice"], str) or row["slice"] == "":
+        return False
+    return True
+
+
+def bqml_evaluation(body):
+    required = {
+        "phase", "runId", "selectedTrialId", "datasetDigest",
+        "metricFloor", "requiredSlices", "rows",
+        "bytesProcessed", "maxBytes"
     }
 
-    if response["reasonCodes"]:
-        response["selectedTrialId"] = None
+    if not isinstance(body, dict) or set(body) != required:
+        return {
+            "runId": body.get("runId") if isinstance(body, dict) else None,
+            "selectedTrialId": (
+                body.get("selectedTrialId") if isinstance(body, dict) else None
+            ),
+            "datasetDigest": (
+                body.get("datasetDigest") if isinstance(body, dict) else None
+            ),
+            "testMetric": None,
+            "criticalSlicePass": False,
+            "decision": "reject",
+            "bytesProcessed": (
+                body.get("bytesProcessed", 0) if isinstance(body, dict) else 0
+            ),
+            "reasonCodes": ["INVALID_INPUT"]
+        }
 
-    RUNS[data["runId"]] = {
-        "request": canonical_request,
-        "response": deepcopy(response)
+    run_id = body["runId"]
+    selected_id = body["selectedTrialId"]
+    digest = body["datasetDigest"]
+    metric_floor = body["metricFloor"]
+    required_slices = body["requiredSlices"]
+    rows = body["rows"]
+    bytes_processed = body["bytesProcessed"]
+    max_bytes = body["maxBytes"]
+
+    codes = []
+
+    if not isinstance(run_id, str) or not run_id or len(run_id) > 128:
+        codes.append("INVALID_INPUT")
+    if not bqml_safe_integer(selected_id):
+        codes.append("INVALID_INPUT")
+    if not bqml_digest(digest):
+        codes.append("INVALID_INPUT")
+    if not bqml_unit(metric_floor):
+        codes.append("INVALID_INPUT")
+
+    if not isinstance(required_slices, dict):
+        codes.append("INVALID_INPUT")
+        required_slices = {}
+    else:
+        for name, floor in required_slices.items():
+            if not isinstance(name, str) or not bqml_unit(floor):
+                codes.append("INVALID_INPUT")
+
+    if not isinstance(rows, list):
+        codes.append("INVALID_INPUT")
+    if not bqml_safe_integer(bytes_processed):
+        codes.append("INVALID_INPUT")
+    if not bqml_safe_integer(max_bytes):
+        codes.append("INVALID_INPUT")
+
+    with BQML_LOCK:
+        stored = BQML_RUNS.get(run_id) if isinstance(run_id, str) else None
+
+    if (
+        stored is None
+        or stored["reasonCodes"]
+        or stored["selectedTrialId"] is None
+        or stored["datasetDigest"] is None
+        or stored["selectedTrialId"] != selected_id
+        or stored["datasetDigest"] != digest
+    ):
+        codes.append("INVALID_LINEAGE")
+
+    valid_rows = []
+    every_valid = True
+    if isinstance(rows, list):
+        for row in rows:
+            if not bqml_test_row_valid(row):
+                every_valid = False
+            else:
+                valid_rows.append(row)
+        if not every_valid:
+            codes.append("INVALID_TEST_ROW")
+
+    skip_metrics = (
+        not isinstance(rows, list)
+        or len(rows) == 0
+        or not every_valid
+    )
+
+    test_metric = None
+    critical_slice_pass = not (
+        "INVALID_INPUT" in codes
+        or "INVALID_LINEAGE" in codes
+        or "INVALID_TEST_ROW" in codes
+        or skip_metrics
+    )
+
+    if not skip_metrics:
+        correct = sum(
+            row["label"] == row["prediction"]
+            for row in valid_rows
+        )
+        test_metric = round(correct / len(valid_rows), 12)
+
+        if test_metric < float(metric_floor):
+            codes.append("AGGREGATE_FLOOR")
+
+        groups = {}
+        for row in valid_rows:
+            groups.setdefault(row["slice"], []).append(row)
+
+        for name, floor in required_slices.items():
+            if name not in groups:
+                codes.append(f"MISSING_SLICE:{name}")
+                critical_slice_pass = False
+                continue
+
+            slice_rows = groups[name]
+            slice_correct = sum(
+                row["label"] == row["prediction"]
+                for row in slice_rows
+            )
+            accuracy = round(slice_correct / len(slice_rows), 12)
+
+            if accuracy < float(floor):
+                codes.append(f"SLICE_FLOOR:{name}")
+                critical_slice_pass = False
+
+    # Cost gate remains active even if test rows are empty/invalid.
+    if (
+        bqml_safe_integer(bytes_processed)
+        and bqml_safe_integer(max_bytes)
+        and bytes_processed > max_bytes
+    ):
+        codes.append("BYTE_LIMIT")
+
+    codes = sorted_codes(codes)
+
+    return {
+        "runId": run_id,
+        "selectedTrialId": selected_id,
+        "datasetDigest": digest,
+        "testMetric": test_metric,
+        "criticalSlicePass": bool(critical_slice_pass),
+        "decision": "admit" if not codes else "reject",
+        "bytesProcessed": bytes_processed,
+        "reasonCodes": codes
     }
 
-    return response, 200
+
+@app.route("/bqml", methods=["POST"])
+def bqml():
+
+    if not request.is_json:
+        return app.response_class(
+            response='{"error":"INVALID_INPUT"}',
+            status=400,
+            mimetype="application/json"
+        )
+
+    try:
+        body = request.get_json()
+    except Exception:
+        return app.response_class(
+            response='{"error":"INVALID_INPUT"}',
+            status=400,
+            mimetype="application/json"
+        )
+
+    if not isinstance(body, dict):
+        return app.response_class(
+            response='{"error":"INVALID_INPUT"}',
+            status=400,
+            mimetype="application/json"
+        )
+
+    phase = body.get("phase")
+    if phase not in ("select", "evaluate"):
+        return app.response_class(
+            response='{"error":"INVALID_INPUT"}',
+            status=400,
+            mimetype="application/json"
+        )
+
+    if phase == "select":
+        run_id = body.get("runId")
+        fingerprint = bqml_fingerprint(body)
+
+        if isinstance(run_id, str):
+            with BQML_LOCK:
+                existing = BQML_RUNS.get(run_id)
+
+            if existing is not None:
+                if existing["fingerprint"] == fingerprint:
+                    return app.response_class(
+                        response=existing["response_json"],
+                        status=200,
+                        mimetype="application/json"
+                    )
+                return app.response_class(
+                    response='{"error":"RUN_ID_CONFLICT"}',
+                    status=409,
+                    mimetype="application/json"
+                )
+
+        response, fingerprint = bqml_selection(body)
+
+        if response is None:
+            return app.response_class(
+                response='{"error":"INVALID_INPUT"}',
+                status=400,
+                mimetype="application/json"
+            )
+
+        response_json = compact_json(response)
+        response_run_id = response["runId"]
+
+        if isinstance(response_run_id, str):
+            with BQML_LOCK:
+                existing = BQML_RUNS.get(response_run_id)
+
+                if existing is not None:
+                    if existing["fingerprint"] == fingerprint:
+                        return app.response_class(
+                            response=existing["response_json"],
+                            status=200,
+                            mimetype="application/json"
+                        )
+                    return app.response_class(
+                        response='{"error":"RUN_ID_CONFLICT"}',
+                        status=409,
+                        mimetype="application/json"
+                    )
+
+                BQML_RUNS[response_run_id] = {
+                    "fingerprint": fingerprint,
+                    "response": response,
+                    "response_json": response_json,
+                    "selectedTrialId": response["selectedTrialId"],
+                    "datasetDigest": response["datasetDigest"],
+                    "reasonCodes": response["reasonCodes"]
+                }
+
+        return app.response_class(
+            response=response_json,
+            status=200,
+            mimetype="application/json"
+        )
+
+    response = bqml_evaluation(body)
+    return app.response_class(
+        response=compact_json(response),
+        status=200,
+        mimetype="application/json"
+    )
 
 
-def valid_evaluation_shape(data):
-    expected = {
-        "phase",
-        "runId",
-        "selectedTrialId",
+# ============================================================
+# Q3 - MLflow Model Promotion Gate
+# Endpoint: POST /promote
+# ============================================================
+
+PROMOTION_LOCK = threading.Lock()
+PROMOTION_REPLAYS = {}
+PROMOTION_ALIAS_VERSION = None
+
+
+def promote_safe_integer(value):
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= 2**53 - 1
+    )
+
+
+def promote_finite(value):
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
+
+
+def promote_unit(value):
+    return (
+        promote_finite(value)
+        and 0 <= float(value) <= 1
+    )
+
+
+def promote_version(value):
+    # Positive safe-integer, canonical decimal string.
+    if not isinstance(value, str):
+        return False
+    if not re.fullmatch(r"[1-9][0-9]*", value):
+        return False
+    try:
+        n = int(value)
+    except Exception:
+        return False
+    return 1 <= n <= 2**53 - 1 and str(n) == value
+
+
+def promote_timestamp(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        return parse_timestamp(value)
+    except Exception:
+        return None
+
+
+def promote_policy_valid(policy):
+    if not isinstance(policy, dict):
+        return False
+
+    required = {
         "datasetDigest",
-        "metricFloor",
+        "schemaDigest",
+        "maxAgeSeconds",
+        "accuracyFloor",
         "requiredSlices",
-        "rows",
-        "bytesProcessed",
-        "maxBytes"
+        "maxLatencyMs",
+        "maxSizeBytes",
+        "minImprovement",
     }
 
-    if not isinstance(data, dict) or set(data.keys()) != expected:
+    if not required.issubset(policy.keys()):
         return False
 
-    if data["phase"] != "evaluate":
+    if (
+        not isinstance(policy["datasetDigest"], str)
+        or not policy["datasetDigest"]
+    ):
         return False
 
-    if not valid_run_id(data["runId"]):
+    if (
+        not isinstance(policy["schemaDigest"], str)
+        or not policy["schemaDigest"]
+    ):
         return False
 
-    if not safe_int(data["selectedTrialId"], nonnegative=True):
+    if (
+        not promote_safe_integer(policy["maxAgeSeconds"])
+    ):
         return False
 
-    if not isinstance(data["datasetDigest"], str):
+    if not promote_unit(policy["accuracyFloor"]):
         return False
 
-    if not HEX64_RE.fullmatch(data["datasetDigest"]):
+    required_slices = policy["requiredSlices"]
+    if not isinstance(required_slices, dict):
         return False
 
-    if not finite_number(data["metricFloor"]):
-        return False
-
-    if not 0 <= data["metricFloor"] <= 1:
-        return False
-
-    if not isinstance(data["requiredSlices"], dict):
-        return False
-
-    for name, floor in data["requiredSlices"].items():
-        if not isinstance(name, str) or name == "":
+    for name, floor in required_slices.items():
+        if not isinstance(name, str):
+            return False
+        if not promote_unit(floor):
             return False
 
-        if not finite_number(floor) or not 0 <= floor <= 1:
-            return False
-
-    if not isinstance(data["rows"], list):
+    if not promote_finite(policy["maxLatencyMs"]):
+        return False
+    if float(policy["maxLatencyMs"]) < 0:
         return False
 
-    if not safe_int(data["bytesProcessed"], nonnegative=True):
+    if not promote_safe_integer(policy["maxSizeBytes"]):
         return False
 
-    if not safe_int(data["maxBytes"], nonnegative=True):
+    if not promote_unit(policy["minImprovement"]):
         return False
 
     return True
 
 
-def valid_test_row(row):
-    return (
-        isinstance(row, dict)
-        and set(row.keys()) == {"label", "prediction", "slice"}
-        and isinstance(row["label"], int)
-        and not isinstance(row["label"], bool)
-        and row["label"] in (0, 1)
-        and isinstance(row["prediction"], int)
-        and not isinstance(row["prediction"], bool)
-        and row["prediction"] in (0, 1)
-        and isinstance(row["slice"], str)
-        and row["slice"] != ""
-    )
+def promote_evaluation_shape_valid(evaluation):
+    if not isinstance(evaluation, dict):
+        return False
 
-
-def evaluate_trial(data):
-    supplied_run_id = data.get("runId") if isinstance(data, dict) else None
-    supplied_trial_id = data.get("selectedTrialId") if isinstance(data, dict) else None
-    supplied_digest = data.get("datasetDigest") if isinstance(data, dict) else None
-    supplied_bytes = data.get("bytesProcessed") if isinstance(data, dict) else None
-
-    response = {
-        "runId": supplied_run_id if isinstance(supplied_run_id, str) else None,
-        "selectedTrialId": (
-            supplied_trial_id
-            if safe_int(supplied_trial_id, nonnegative=True)
-            else None
-        ),
-        "datasetDigest": (
-            supplied_digest
-            if isinstance(supplied_digest, str)
-            else None
-        ),
-        "testMetric": None,
-        "criticalSlicePass": False,
-        "decision": "reject",
-        "bytesProcessed": (
-            supplied_bytes
-            if safe_int(supplied_bytes, nonnegative=True)
-            else None
-        ),
-        "reasonCodes": []
+    required = {
+        "createdAt",
+        "artifactDigest",
+        "datasetDigest",
+        "schemaDigest",
+        "accuracy",
+        "latencyMs",
+        "sizeBytes",
+        "slices",
     }
 
-    if not valid_evaluation_shape(data):
-        response["reasonCodes"] = ["INVALID_INPUT"]
-        return response, 200
+    return required.issubset(evaluation.keys())
 
-    reason_codes = []
 
-    stored = RUNS.get(data["runId"])
+def promote_failed_codes_add(failed, version, codes):
+    if version not in failed:
+        failed[version] = []
+    failed[version].extend(codes)
 
-    lineage_valid = (
-        stored is not None
-        and stored["response"]["selectedTrialId"] is not None
-        and stored["response"]["selectedTrialId"] == data["selectedTrialId"]
-        and stored["response"]["datasetDigest"] == data["datasetDigest"]
-    )
 
-    if not lineage_valid:
-        reason_codes.append("INVALID_LINEAGE")
+def promote_failed_codes_normalize(failed):
+    for version in list(failed.keys()):
+        failed[version] = sorted_codes(failed[version])
 
-    all_rows_valid = (
-        len(data["rows"]) > 0
-        and all(valid_test_row(row) for row in data["rows"])
-    )
 
-    if not all_rows_valid:
-        reason_codes.append("INVALID_TEST_ROW")
+def promote_fingerprint(body):
+    # Request replay identity is independent of JSON member ordering.
+    return hashlib.sha256(
+        json.dumps(
+            body,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True
+        ).encode("utf-8")
+    ).hexdigest()
 
-    if data["bytesProcessed"] > data["maxBytes"]:
-        reason_codes.append("BYTE_LIMIT")
 
-    if all_rows_valid:
-        correct = sum(
-            row["label"] == row["prediction"]
-            for row in data["rows"]
-        )
+def promote_evaluate_version(version_obj, policy, as_of):
+    """
+    Return all independently applicable gate failures for one
+    otherwise structurally valid version.
 
-        test_metric = round(correct / len(data["rows"]), 12)
-        response["testMetric"] = test_metric
+    Mutable tags/descriptions are deliberately ignored.
+    """
 
-        if test_metric < data["metricFloor"]:
-            reason_codes.append("AGGREGATE_FLOOR")
+    failures = []
 
-        slice_rows = {}
+    if "evaluation" not in version_obj or version_obj["evaluation"] is None:
+        return ["MISSING_EVALUATION"]
 
-        for row in data["rows"]:
-            slice_rows.setdefault(row["slice"], []).append(row)
+    evaluation = version_obj["evaluation"]
 
-        all_slice_gates_pass = True
+    if not promote_evaluation_shape_valid(evaluation):
+        # A present but unusable evaluation has no dedicated
+        # schema code in this contract. Treat it as missing
+        # evidence.
+        return ["MISSING_EVALUATION"]
 
-        for required_slice, floor in data["requiredSlices"].items():
-            if required_slice not in slice_rows:
-                reason_codes.append(f"MISSING_SLICE:{required_slice}")
-                all_slice_gates_pass = False
+    created = promote_timestamp(evaluation["createdAt"])
+
+    if created is None:
+        failures.append("INVALID_TIMESTAMP")
+
+    # Numeric evidence checks.
+    accuracy = evaluation["accuracy"]
+    latency = evaluation["latencyMs"]
+    size = evaluation["sizeBytes"]
+
+    if not promote_finite(accuracy):
+        failures.append("NON_FINITE")
+    elif not promote_unit(accuracy):
+        failures.append("METRIC_RANGE")
+
+    if not promote_finite(latency):
+        failures.append("NON_FINITE")
+    elif float(latency) < 0:
+        failures.append("METRIC_RANGE")
+
+    if not promote_safe_integer(size):
+        failures.append("NON_FINITE")
+    # sizeBytes is specified as a non-negative safe integer;
+    # an invalid type/value is a metric/evidence failure.
+    elif size < 0:
+        failures.append("METRIC_RANGE")
+
+    # Evaluation timestamp gates.
+    if created is not None:
+        if created > as_of:
+            failures.append("FUTURE_EVALUATION")
+        else:
+            lower = as_of - timedelta(
+                seconds=policy["maxAgeSeconds"]
+            )
+            if created < lower:
+                failures.append("STALE_EVALUATION")
+
+    # Registered artifact must match evaluation evidence.
+    if evaluation["artifactDigest"] != version_obj.get("artifactDigest"):
+        failures.append("ARTIFACT_MISMATCH")
+
+    if evaluation["datasetDigest"] != policy["datasetDigest"]:
+        failures.append("DATASET_MISMATCH")
+
+    if evaluation["schemaDigest"] != policy["schemaDigest"]:
+        failures.append("SCHEMA_MISMATCH")
+
+    # Aggregate gates. Do not add these when the corresponding
+    # numeric value is unusable; NON_FINITE/METRIC_RANGE is the
+    # applicable evidence failure.
+    if promote_unit(accuracy):
+        if float(accuracy) < float(policy["accuracyFloor"]):
+            failures.append("ACCURACY_FLOOR")
+
+    if promote_finite(latency) and float(latency) >= 0:
+        if float(latency) > float(policy["maxLatencyMs"]):
+            failures.append("LATENCY_LIMIT")
+
+    if promote_safe_integer(size):
+        if size > policy["maxSizeBytes"]:
+            failures.append("SIZE_LIMIT")
+
+    # Required slices.
+    slices = evaluation["slices"]
+
+    if not isinstance(slices, dict):
+        for name in policy["requiredSlices"]:
+            failures.append(f"MISSING_SLICE:{name}")
+    else:
+        for name, floor in policy["requiredSlices"].items():
+
+            if name not in slices:
+                failures.append(f"MISSING_SLICE:{name}")
                 continue
 
-            rows_for_slice = slice_rows[required_slice]
-            slice_accuracy = round(
-                sum(
-                    row["label"] == row["prediction"]
-                    for row in rows_for_slice
-                ) / len(rows_for_slice),
-                12
+            value = slices[name]
+
+            if not promote_finite(value):
+                failures.append(f"SLICE_RANGE:{name}")
+                continue
+
+            if not promote_unit(value):
+                failures.append(f"SLICE_RANGE:{name}")
+                continue
+
+            if float(value) < float(floor):
+                failures.append(f"SLICE_FLOOR:{name}")
+
+    return sorted_codes(failures)
+
+
+def promote_process(body):
+    """
+    Process a valid /promote request.
+    """
+
+    as_of = promote_timestamp(body["asOf"])
+    policy = body["policy"]
+    versions = body["versions"]
+    champion_version = body["championVersion"]
+
+    failed = {}
+    valid_objects = []
+    seen_versions = set()
+
+    # --------------------------------------------------------
+    # First pass: reject noncanonical/duplicate versions BEFORE
+    # constructing the lookup map.
+    # --------------------------------------------------------
+
+    for obj in versions:
+
+        if not isinstance(obj, dict):
+            # No version key available to attach to.
+            continue
+
+        version = obj.get("version")
+
+        if not promote_version(version):
+            if isinstance(version, str):
+                promote_failed_codes_add(
+                    failed,
+                    version,
+                    ["INVALID_VERSION"]
+                )
+            continue
+
+        if version in seen_versions:
+            promote_failed_codes_add(
+                failed,
+                version,
+                ["DUPLICATE_VERSION"]
+            )
+            continue
+
+        seen_versions.add(version)
+
+        valid_objects.append(obj)
+
+    # A canonical version that has appeared more than once is
+    # unusable. Remove it from the lookup/candidate set.
+    duplicate_versions = {
+        version
+        for version, codes in failed.items()
+        if "DUPLICATE_VERSION" in codes
+    }
+
+    valid_objects = [
+        obj
+        for obj in valid_objects
+        if obj["version"] not in duplicate_versions
+    ]
+
+    # --------------------------------------------------------
+    # Every listed canonical version receives its gate list.
+    # --------------------------------------------------------
+
+    if not promote_policy_valid(policy):
+        for obj in valid_objects:
+            promote_failed_codes_add(
+                failed,
+                obj["version"],
+                ["INVALID_POLICY"]
             )
 
-            if slice_accuracy < floor:
-                reason_codes.append(f"SLICE_FLOOR:{required_slice}")
-                all_slice_gates_pass = False
-
-        # Defined specifically for critical required slice
-        if "critical" in data["requiredSlices"]:
-            if "critical" in slice_rows:
-                critical_rows = slice_rows["critical"]
-                critical_accuracy = round(
-                    sum(
-                        row["label"] == row["prediction"]
-                        for row in critical_rows
-                    ) / len(critical_rows),
-                    12
+        for version in list(failed.keys()):
+            if (
+                promote_version(version)
+                and version not in duplicate_versions
+            ):
+                promote_failed_codes_add(
+                    failed,
+                    version,
+                    ["INVALID_POLICY"]
                 )
 
-                response["criticalSlicePass"] = (
-                    critical_accuracy >= data["requiredSlices"]["critical"]
-                )
-            else:
-                response["criticalSlicePass"] = False
-        else:
-            response["criticalSlicePass"] = True
+        promote_failed_codes_normalize(failed)
 
-    response["reasonCodes"] = sorted_codes(reason_codes)
-    response["decision"] = (
-        "admit"
-        if len(response["reasonCodes"]) == 0
-        else "reject"
+        return {
+            "action": "block",
+            "championVersion": champion_version,
+            "selectedVersion": None,
+            "eligibleVersions": [],
+            "failedGates": failed,
+            "aliasMutation": None,
+            "evidence": None,
+        }
+
+    # --------------------------------------------------------
+    # Build lookup only AFTER invalid/duplicate rejection.
+    # --------------------------------------------------------
+
+    lookup = {
+        obj["version"]: obj
+        for obj in valid_objects
+    }
+
+    eligible = []
+
+    for obj in valid_objects:
+
+        version = obj["version"]
+
+        failures = promote_evaluate_version(
+            obj,
+            policy,
+            as_of
+        )
+
+        promote_failed_codes_add(
+            failed,
+            version,
+            failures
+        )
+
+        if not failures:
+            eligible.append(obj)
+
+    # --------------------------------------------------------
+    # Champion evidence must be valid.
+    # --------------------------------------------------------
+
+    champion_obj = lookup.get(
+        champion_version
     )
 
-    # Requirement: false with invalid lineage/input/test rows/missing or failed slice.
-    if (
-        not lineage_valid
-        or not all_rows_valid
-        or any(
-            code.startswith("MISSING_SLICE:")
-            or code.startswith("SLICE_FLOOR:")
-            for code in response["reasonCodes"]
+    champion_valid = (
+        champion_obj is not None
+        and champion_version not in duplicate_versions
+        and not any(
+            failed.get(champion_version, [])
         )
+    )
+
+    # If champion itself is not a valid listed version, make the
+    # reason visible when possible.
+    if champion_obj is None:
+        if not promote_version(champion_version):
+            promote_failed_codes_add(
+                failed,
+                champion_version,
+                ["INVALID_VERSION"]
+            )
+        else:
+            promote_failed_codes_add(
+                failed,
+                champion_version,
+                ["MISSING_EVALUATION"]
+            )
+
+        promote_failed_codes_normalize(failed)
+        return {
+            "action": "block",
+            "championVersion": champion_version,
+            "selectedVersion": None,
+            "eligibleVersions": sorted(
+                [v["version"] for v in eligible],
+                key=lambda x: int(x)
+            ),
+            "failedGates": failed,
+            "aliasMutation": None,
+            "evidence": None,
+        }
+
+    if not champion_valid:
+        promote_failed_codes_normalize(failed)
+        return {
+            "action": "block",
+            "championVersion": champion_version,
+            "selectedVersion": None,
+            "eligibleVersions": sorted(
+                [v["version"] for v in eligible],
+                key=lambda x: int(x)
+            ),
+            "failedGates": failed,
+            "aliasMutation": None,
+            "evidence": None,
+        }
+
+    # --------------------------------------------------------
+    # Rank eligible versions:
+    # accuracy DESC, latency ASC, size ASC, numeric version ASC
+    # --------------------------------------------------------
+
+    eligible.sort(
+        key=lambda obj: (
+            -float(obj["evaluation"]["accuracy"]),
+            float(obj["evaluation"]["latencyMs"]),
+            obj["evaluation"]["sizeBytes"],
+            int(obj["version"])
+        )
+    )
+
+    eligible_versions = [
+        obj["version"]
+        for obj in sorted(
+            eligible,
+            key=lambda obj: int(obj["version"])
+        )
+    ]
+
+    # Best eligible challenger is the top-ranked eligible version
+    # other than the champion.
+    challengers = [
+        obj
+        for obj in eligible
+        if obj["version"] != champion_version
+    ]
+
+    if not challengers:
+        promote_failed_codes_normalize(failed)
+
+        return {
+            "action": "retain",
+            "championVersion": champion_version,
+            "selectedVersion": champion_version,
+            "eligibleVersions": eligible_versions,
+            "failedGates": failed,
+            "aliasMutation": None,
+            "evidence": champion_obj["evaluation"],
+        }
+
+    challenger = challengers[0]
+
+    improvement = round(
+        float(challenger["evaluation"]["accuracy"])
+        - float(champion_obj["evaluation"]["accuracy"]),
+        12
+    )
+
+    if improvement >= float(policy["minImprovement"]):
+
+        result = {
+            "action": "promote",
+            "championVersion": champion_version,
+            "selectedVersion": challenger["version"],
+            "eligibleVersions": eligible_versions,
+            "failedGates": failed,
+            "aliasMutation": {
+                "alias": "champion",
+                "version": challenger["version"]
+            },
+            "evidence": challenger["evaluation"],
+        }
+
+        # Persist alias mutation and exact replay response.
+        with PROMOTION_LOCK:
+            global PROMOTION_ALIAS_VERSION
+            PROMOTION_ALIAS_VERSION = challenger["version"]
+
+        promote_failed_codes_normalize(
+            result["failedGates"]
+        )
+
+        return result
+
+    promote_failed_codes_normalize(failed)
+
+    return {
+        "action": "retain",
+        "championVersion": champion_version,
+        "selectedVersion": champion_version,
+        "eligibleVersions": eligible_versions,
+        "failedGates": failed,
+        "aliasMutation": None,
+        "evidence": champion_obj["evaluation"],
+    }
+
+
+@app.route("/promote", methods=["POST"])
+def promote():
+
+    if not request.is_json:
+        return app.response_class(
+            response='{"error":"INVALID_INPUT"}',
+            status=400,
+            mimetype="application/json"
+        )
+
+    try:
+        body = request.get_json()
+    except Exception:
+        return app.response_class(
+            response='{"error":"INVALID_INPUT"}',
+            status=400,
+            mimetype="application/json"
+        )
+
+    # --------------------------------------------------------
+    # Explicit HTTP-400 contract cases.
+    # --------------------------------------------------------
+
+    if not isinstance(body, dict):
+        return app.response_class(
+            response='{"error":"INVALID_INPUT"}',
+            status=400,
+            mimetype="application/json"
+        )
+
+    if not isinstance(body.get("championVersion"), str):
+        return app.response_class(
+            response='{"error":"INVALID_INPUT"}',
+            status=400,
+            mimetype="application/json"
+        )
+
+    if "policy" not in body:
+        return app.response_class(
+            response='{"error":"INVALID_INPUT"}',
+            status=400,
+            mimetype="application/json"
+        )
+
+    if "versions" not in body or not isinstance(
+        body["versions"], list
     ):
-        response["criticalSlicePass"] = False
+        return app.response_class(
+            response='{"error":"INVALID_INPUT"}',
+            status=400,
+            mimetype="application/json"
+        )
 
-    return response, 200
+    if "asOf" not in body:
+        return app.response_class(
+            response='{"error":"INVALID_INPUT"}',
+            status=400,
+            mimetype="application/json"
+        )
+
+    # Other malformed top-level requests are represented by
+    # INVALID_POLICY / INVALID_VERSION where applicable, but a
+    # missing core request member is an invalid request.
+    required = {
+        "asOf",
+        "championVersion",
+        "policy",
+        "versions"
+    }
+
+    if not required.issubset(body.keys()):
+        return app.response_class(
+            response='{"error":"INVALID_INPUT"}',
+            status=400,
+            mimetype="application/json"
+        )
+
+    # --------------------------------------------------------
+    # Validate asOf before processing evidence.
+    # --------------------------------------------------------
+
+    if promote_timestamp(body["asOf"]) is None:
+        return app.response_class(
+            response='{"error":"INVALID_INPUT"}',
+            status=400,
+            mimetype="application/json"
+        )
+
+    # --------------------------------------------------------
+    # Deterministic replay.
+    # --------------------------------------------------------
+
+    fingerprint = promote_fingerprint(body)
+
+    with PROMOTION_LOCK:
+        replay = PROMOTION_REPLAYS.get(
+            fingerprint
+        )
+
+    if replay is not None:
+        return app.response_class(
+            response=replay,
+            status=200,
+            mimetype="application/json"
+        )
+
+    result = promote_process(body)
+    response_json = compact_json(result)
+
+    with PROMOTION_LOCK:
+        PROMOTION_REPLAYS[fingerprint] = response_json
+
+    return app.response_class(
+        response=response_json,
+        status=200,
+        mimetype="application/json"
+    )
 
 
-@app.post("/bqml")
-def bqml():
-    data = request.get_json(silent=True)
 
-    if not isinstance(data, dict) or data.get("phase") not in {"select", "evaluate"}:
-        return jsonify({"error": "INVALID_INPUT"}), 400
+# ============================================================
+# Simple root endpoint
+# ============================================================
 
-    if data["phase"] == "select":
-        response, status = select_trial(data)
-        return jsonify(response), status
-
-    response, status = evaluate_trial(data)
-    return jsonify(response), status
+@app.route("/", methods=["GET"])
+def home():
+    return "JSONL corpus service is running"
 
 
-@app.get("/")
-def health():
-    return jsonify({
-        "status": "ok",
-        "endpoints": [
-            "POST /build-corpus",
-            "POST /bqml"
-        ]
-    })
-
+# ============================================================
+# Local execution
+# ============================================================
 
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
     app.run(host="0.0.0.0", port=5000)
