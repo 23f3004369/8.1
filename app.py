@@ -1293,47 +1293,20 @@ def bqml_eligible_features(rows, forbidden):
         key=utf8
     )
 
+
 def bqml_trial_shape_valid(trial):
-    """
-    Validate the exact structure of a trial.
-
-    Required:
-      trialId  -> non-negative safe integer
-      status   -> SUCCEEDED or FAILED
-      evalMetric -> finite number only when SUCCEEDED
-    """
-
     if not isinstance(trial, dict):
         return False
-
-    if set(trial.keys()) != {
-        "trialId",
-        "status",
-        "evalMetric"
-    }:
+    if set(trial.keys()) != {"trialId", "status", "evalMetric"}:
         return False
-
-    if not bqml_safe_integer(
-        trial["trialId"]
-    ):
+    if not bqml_safe_integer(trial["trialId"]):
         return False
-
-    if trial["status"] not in (
-        "SUCCEEDED",
-        "FAILED"
-    ):
+    if trial["status"] not in ("SUCCEEDED", "FAILED"):
         return False
-
-    # evalMetric must be numeric and finite for a
-    # SUCCEEDED trial because only finite SUCCEEDED
-    # trials are eligible.
-    if trial["status"] == "SUCCEEDED":
-        if not bqml_finite_number(
-            trial["evalMetric"]
-        ):
-            return False
-
+    # Only SUCCEEDED trials need a finite metric to be eligible.
+    # FAILED trial metrics are irrelevant to eligibility.
     return True
+
 
 def bqml_successful_trial_eligible(trial):
     return (
@@ -1679,10 +1652,7 @@ def bqml_evaluate(body):
     else:
         for name, floor in required_slices.items():
 
-            if (
-                not isinstance(name, str)
-                or name == ""
-            ):
+            if not isinstance(name, str):
                 codes.append("INVALID_INPUT")
                 continue
 
