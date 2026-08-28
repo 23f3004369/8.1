@@ -3444,1211 +3444,876 @@ def adapt():
 
 
 # ============================================================
-# Q5 - Quantize and Admit a Model
-# Endpoint: POST /quantize
+# Q6 - Recover a Content-Addressed ML Pipeline
+# Endpoint: POST /pipeline
 # ============================================================
 
-QUANTIZE_FREEZES = {}
+PIPELINE_DAG = (
+    "verify_data",
+    "prepare",
+    "train",
+    "evaluate",
+    "register",
+    "publish",
+)
 
-QUANTIZE_SAFE_MAX = 9007199254740991
+PIPELINE_INPUT_NAMES = (
+    "generation",
+    "checksum",
+    "canonicalData",
+    "prepareCode",
+    "prepareConfig",
+    "trainCode",
+    "trainConfig",
+    "runtime",
+    "evaluateCode",
+    "evaluateConfig",
+    "schemaDigest",
+    "publishConfig",
+)
+
+PIPELINE_STATUS_VALUES = {
+    "started",
+    "succeeded",
+    "retryable_failed",
+    "terminal_failed",
+}
+
+PIPELINE_STATES = {}
 
 
-def quantize_safe_integer(value):
+def pipeline_sha(value):
+    return hashlib.sha256(
+        value.encode("utf-8")
+    ).hexdigest()
+
+
+def pipeline_compact(value):
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":")
+    )
+
+
+def pipeline_hash_array(values):
+    return pipeline_sha(
+        pipeline_compact(values)
+    )
+
+
+def pipeline_safe_positive_integer(value):
     return (
         isinstance(value, int)
         and not isinstance(value, bool)
-        and 0 <= value <= QUANTIZE_SAFE_MAX
+        and 1 <= value <= 9007199254740991
     )
 
 
-def quantize_finite(value):
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(float(value))
-    )
-
-
-def quantize_nonnegative_finite(value):
-    return (
-        quantize_finite(value)
-        and float(value) >= 0
-    )
-
-
-def quantize_unit(value):
-    return (
-        quantize_finite(value)
-        and 0 <= float(value) <= 1
-    )
-
-
-def quantize_digest(value):
+def pipeline_valid_nonempty_string(value):
     return (
         isinstance(value, str)
-        and len(value) > 0
+        and value != ""
     )
 
 
-def quantize_sha256(value):
+def pipeline_event_shape(event):
     return (
-        isinstance(value, str)
-        and re.fullmatch(
-            r"[0-9a-f]{64}",
-            value
-        ) is not None
+        isinstance(event, dict)
+        and set(event.keys()) == {
+            "eventId",
+            "revision",
+            "node",
+            "attempt",
+            "status",
+            "key",
+            "artifactDigest",
+            "receiptId",
+        }
     )
 
 
-def quantize_unique_nonempty_strings(value):
-    if not isinstance(value, list):
-        return False
-
-    if not value:
-        return False
-
-    if any(
-        not isinstance(x, str) or x == ""
-        for x in value
-    ):
-        return False
-
-    return len(set(value)) == len(value)
-
-
-def quantize_inventory(inventory):
+def pipeline_make_keys(inputs, artifacts):
     """
-    Validate a recorded inventory and recompute:
-      - totalBytes
-      - packageDigest
+    Compute the six immutable content-addressed keys.
 
-    Inventory key order:
-      name, bytes, sha256
+    A downstream key is null until its parent artifact exists.
     """
 
-    if not isinstance(inventory, list):
-        return None, None, False
+    keys = {}
 
-    seen = set()
-    normalized = []
+    # verify_data
+    keys["verify_data"] = pipeline_hash_array([
+        inputs["generation"],
+        inputs["checksum"],
+    ])
 
-    for item in inventory:
-
-        if not isinstance(item, dict):
-            return None, None, False
-
-        if set(item.keys()) != {
-            "name",
-            "bytes",
-            "sha256"
-        }:
-            return None, None, False
-
-        name = item["name"]
-        byte_count = item["bytes"]
-        digest = item["sha256"]
-
-        if (
-            not isinstance(name, str)
-            or name == ""
-            or name in seen
-        ):
-            return None, None, False
-
-        if not quantize_safe_integer(
-            byte_count
-        ):
-            return None, None, False
-
-        if not quantize_sha256(digest):
-            return None, None, False
-
-        seen.add(name)
-
-        normalized.append({
-            "name": name,
-            "bytes": byte_count,
-            "sha256": digest
-        })
-
-    normalized.sort(
-        key=lambda x: utf8(x["name"])
+    # prepare
+    prepare_artifact = artifacts.get(
+        "verify_data"
     )
 
-    total = 0
+    if prepare_artifact is None:
+        keys["prepare"] = None
+    else:
+        keys["prepare"] = pipeline_hash_array([
+            inputs["canonicalData"],
+            inputs["prepareCode"],
+            inputs["prepareConfig"],
+        ])
 
-    for item in normalized:
-
-        total += item["bytes"]
-
-        if total > QUANTIZE_SAFE_MAX:
-            return None, None, False
-
-    package_digest = hashlib.sha256(
-        compact_json(
-            normalized
-        ).encode("utf-8")
-    ).hexdigest()
-
-    return (
-        normalized,
-        total,
-        package_digest,
-        True
+    # train
+    train_parent = artifacts.get(
+        "prepare"
     )
 
+    if train_parent is None:
+        keys["train"] = None
+    else:
+        keys["train"] = pipeline_hash_array([
+            train_parent,
+            inputs["trainCode"],
+            inputs["trainConfig"],
+            inputs["runtime"],
+        ])
 
-def quantize_freeze_candidate(candidate,
-                               calibration_digest,
-                               tokenizer_digest,
-                               allowed_reasons):
+    # evaluate
+    evaluate_parent = artifacts.get(
+        "train"
+    )
 
-    if not isinstance(candidate, dict):
-        return {
-            "name": "",
-            "status": "invalid",
-            "inventory": [],
-            "totalBytes": None,
-            "packageDigest": None,
-            "reasonCodes": [
-                "INVALID_INPUT"
-            ]
+    if evaluate_parent is None:
+        keys["evaluate"] = None
+    else:
+        keys["evaluate"] = pipeline_hash_array([
+            evaluate_parent,
+            inputs["canonicalData"],
+            inputs["evaluateCode"],
+            inputs["evaluateConfig"],
+        ])
+
+    # register
+    register_parent = artifacts.get(
+        "evaluate"
+    )
+
+    if register_parent is None:
+        keys["register"] = None
+    else:
+        keys["register"] = pipeline_hash_array([
+            register_parent,
+            inputs["schemaDigest"],
+        ])
+
+    # publish
+    publish_parent = artifacts.get(
+        "register"
+    )
+
+    if publish_parent is None:
+        keys["publish"] = None
+    else:
+        keys["publish"] = pipeline_hash_array([
+            publish_parent,
+            inputs["publishConfig"],
+        ])
+
+    return keys
+
+
+def pipeline_dependency_digests(
+    node,
+    inputs,
+    key,
+    artifacts
+):
+    """
+    Response dependencyDigests.
+
+    Contains the named inputs relevant to the node plus cacheKey.
+    """
+
+    if node == "verify_data":
+        result = {
+            "generation": inputs["generation"],
+            "checksum": inputs["checksum"],
         }
 
-    required = {
-        "name",
-        "files",
-        "loadable",
-        "calibrationDigest",
-        "tokenizerDigest"
-    }
+    elif node == "prepare":
+        result = {
+            "canonicalData": inputs["canonicalData"],
+            "prepareCode": inputs["prepareCode"],
+            "prepareConfig": inputs["prepareConfig"],
+        }
 
-    optional = {
-        "unsupportedReason"
-    }
-
-    if (
-        not required.issubset(candidate.keys())
-        or not set(candidate.keys()).issubset(
-            required | optional
-        )
-    ):
-        return {
-            "name": (
-                candidate.get("name", "")
-                if isinstance(
-                    candidate.get("name", ""),
-                    str
-                )
-                else ""
+    elif node == "train":
+        result = {
+            "prepareArtifact": artifacts.get(
+                "prepare"
             ),
-            "status": "invalid",
-            "inventory": [],
-            "totalBytes": None,
-            "packageDigest": None,
-            "reasonCodes": [
-                "INVALID_INPUT"
-            ]
+            "trainCode": inputs["trainCode"],
+            "trainConfig": inputs["trainConfig"],
+            "runtime": inputs["runtime"],
         }
 
-    name = candidate["name"]
-
-    codes = []
-
-    if (
-        not isinstance(name, str)
-        or name == ""
-    ):
-        codes.append("INVALID_INPUT")
-
-    files = candidate["files"]
-
-    if not isinstance(files, dict):
-        codes.append("INVALID_INPUT")
-        files = {}
-
-    else:
-        for filename, content in files.items():
-
-            if (
-                not isinstance(filename, str)
-                or filename == ""
-                or not isinstance(content, str)
-            ):
-                codes.append("INVALID_INPUT")
-
-    if not isinstance(
-        candidate["loadable"],
-        bool
-    ):
-        codes.append("INVALID_INPUT")
-
-    if not quantize_digest(
-        candidate["calibrationDigest"]
-    ):
-        codes.append("INVALID_INPUT")
-
-    if not quantize_digest(
-        candidate["tokenizerDigest"]
-    ):
-        codes.append("INVALID_INPUT")
-
-    unsupported_reason = candidate.get(
-        "unsupportedReason"
-    )
-
-    if (
-        unsupported_reason is not None
-        and (
-            not isinstance(
-                unsupported_reason,
-                str
-            )
-            or unsupported_reason == ""
-        )
-    ):
-        codes.append("INVALID_INPUT")
-
-    if codes:
-        return {
-            "name": (
-                name
-                if isinstance(name, str)
-                else ""
+    elif node == "evaluate":
+        result = {
+            "trainArtifact": artifacts.get(
+                "train"
             ),
-            "status": "invalid",
-            "inventory": [],
-            "totalBytes": None,
-            "packageDigest": None,
-            "reasonCodes": sorted_codes(codes)
+            "canonicalData": inputs["canonicalData"],
+            "evaluateCode": inputs["evaluateCode"],
+            "evaluateConfig": inputs["evaluateConfig"],
         }
 
-    # --------------------------------------------------------
-    # Build exact file inventory.
-    # --------------------------------------------------------
-
-    inventory = []
-
-    for filename, content in files.items():
-
-        raw = content.encode("utf-8")
-
-        inventory.append({
-            "name": filename,
-            "bytes": len(raw),
-            "sha256": hashlib.sha256(
-                raw
-            ).hexdigest()
-        })
-
-    inventory.sort(
-        key=lambda x: utf8(x["name"])
-    )
-
-    total_bytes = sum(
-        item["bytes"]
-        for item in inventory
-    )
-
-    package_digest = hashlib.sha256(
-        compact_json(
-            inventory
-        ).encode("utf-8")
-    ).hexdigest()
-
-    # --------------------------------------------------------
-    # Determine candidate status.
-    # --------------------------------------------------------
-
-    if unsupported_reason is not None:
-
-        if unsupported_reason in allowed_reasons:
-
-            # Allowed unsupported candidates are frozen as
-            # unsupported and don't need the normal
-            # loadability/lineage gates.
-            status = "unsupported"
-
-        else:
-
-            codes.append(
-                "UNALLOWED_UNSUPPORTED_REASON"
-            )
-
-            # The ordinary requirements still apply.
-            if not candidate["loadable"]:
-                codes.append(
-                    "NOT_LOADABLE"
-                )
-
-            if (
-                candidate["calibrationDigest"]
-                != calibration_digest
-            ):
-                codes.append(
-                    "CALIBRATION_MISMATCH"
-                )
-
-            if (
-                candidate["tokenizerDigest"]
-                != tokenizer_digest
-            ):
-                codes.append(
-                    "TOKENIZER_MISMATCH"
-                )
-
-            status = (
-                "invalid"
-                if codes
-                else "frozen"
-            )
+    elif node == "register":
+        result = {
+            "evaluateArtifact": artifacts.get(
+                "evaluate"
+            ),
+            "schemaDigest": inputs["schemaDigest"],
+        }
 
     else:
+        result = {
+            "registerArtifact": artifacts.get(
+                "register"
+            ),
+            "publishConfig": inputs["publishConfig"],
+        }
 
-        if not candidate["loadable"]:
-            codes.append(
-                "NOT_LOADABLE"
-            )
+    result["cacheKey"] = key
+
+    return result
+
+
+def pipeline_parent(node):
+    index = PIPELINE_DAG.index(node)
+
+    if index == 0:
+        return None
+
+    return PIPELINE_DAG[index - 1]
+
+
+def pipeline_descendants_have_terminal(
+    node,
+    states
+):
+    parent = pipeline_parent(node)
+
+    while parent is not None:
+
+        state = states.get(parent)
 
         if (
-            candidate["calibrationDigest"]
-            != calibration_digest
+            state is not None
+            and state.get("status")
+            == "terminal_failed"
         ):
-            codes.append(
-                "CALIBRATION_MISMATCH"
-            )
+            return True
 
-        if (
-            candidate["tokenizerDigest"]
-            != tokenizer_digest
-        ):
-            codes.append(
-                "TOKENIZER_MISMATCH"
-            )
+        parent = pipeline_parent(parent)
 
-        status = (
-            "invalid"
-            if codes
-            else "frozen"
-        )
+    return False
 
-    return {
-        "name": name,
-        "status": status,
-        "inventory": inventory,
-        "totalBytes": total_bytes,
-        "packageDigest": package_digest,
-        "reasonCodes": sorted_codes(codes)
-    }
 
+def pipeline_has_pending_ancestor(
+    node,
+    states,
+    artifacts
+):
+    parent = pipeline_parent(node)
 
-def quantize_freeze(body):
+    while parent is not None:
 
-    required = {
-        "phase",
-        "freezeId",
-        "calibrationDigest",
-        "tokenizerDigest",
-        "allowedUnsupportedReasons",
-        "candidates"
-    }
-
-    if (
-        not isinstance(body, dict)
-        or not required.issubset(body.keys())
-        or body.get("phase") != "freeze"
-    ):
-        return None
-
-    freeze_id = body["freezeId"]
-
-    if (
-        not isinstance(freeze_id, str)
-        or freeze_id == ""
-        or len(freeze_id) > 128
-    ):
-        return None
-
-    calibration_digest = body[
-        "calibrationDigest"
-    ]
-
-    tokenizer_digest = body[
-        "tokenizerDigest"
-    ]
-
-    if not quantize_digest(
-        calibration_digest
-    ):
-        return None
-
-    if not quantize_digest(
-        tokenizer_digest
-    ):
-        return None
-
-    allowed_reasons = body[
-        "allowedUnsupportedReasons"
-    ]
-
-    if not isinstance(
-        allowed_reasons,
-        list
-    ):
-        return None
-
-    if any(
-        not isinstance(x, str)
-        or x == ""
-        for x in allowed_reasons
-    ):
-        return None
-
-    if len(set(allowed_reasons)) != len(
-        allowed_reasons
-    ):
-        return None
-
-    candidates = body["candidates"]
-
-    if (
-        not isinstance(candidates, list)
-        or len(candidates) == 0
-    ):
-        return None
-
-    names = []
-
-    for candidate in candidates:
-
-        if not isinstance(candidate, dict):
-            return None
-
-        name = candidate.get("name")
-
-        if (
-            not isinstance(name, str)
-            or name == ""
-        ):
-            return None
-
-        names.append(name)
-
-    if len(set(names)) != len(names):
-        return None
-
-    results = []
-
-    for candidate in candidates:
-
-        results.append(
-            quantize_freeze_candidate(
-                candidate,
-                calibration_digest,
-                tokenizer_digest,
-                set(allowed_reasons)
-            )
-        )
-
-    results.sort(
-        key=lambda x: utf8(x["name"])
-    )
-
-    return {
-        "freezeId": freeze_id,
-        "candidates": results
-    }
-
-
-# ============================================================
-# Q5 SELECT helpers
-# ============================================================
-
-def quantize_validate_frozen_candidate(candidate):
-
-    if not isinstance(candidate, dict):
-        return False
-
-    if set(candidate.keys()) != {
-        "name",
-        "status",
-        "inventory",
-        "totalBytes",
-        "packageDigest",
-        "reasonCodes"
-    }:
-        return False
-
-    if (
-        not isinstance(candidate["name"], str)
-        or candidate["name"] == ""
-    ):
-        return False
-
-    if candidate["status"] not in (
-        "frozen",
-        "unsupported",
-        "invalid"
-    ):
-        return False
-
-    if not isinstance(
-        candidate["reasonCodes"],
-        list
-    ):
-        return False
-
-    if any(
-        not isinstance(x, str)
-        for x in candidate["reasonCodes"]
-    ):
-        return False
-
-    inventory_result = quantize_inventory(
-        candidate["inventory"]
-    )
-
-    if len(inventory_result) == 4:
-        inventory, total, digest, valid = (
-            inventory_result
-        )
-    else:
-        inventory, total, digest, valid = (
-            None,
-            None,
-            None,
-            False
-        )
-
-    if not valid:
-        return False
-
-    if candidate["status"] == "invalid":
-        if (
-            candidate["totalBytes"] is not None
-            or candidate["packageDigest"] is not None
-        ):
-            return False
-    else:
-        if candidate["totalBytes"] != total:
-            return False
-
-        if candidate["packageDigest"] != digest:
-            return False
-
-    return True
-
-
-def quantize_accuracy(rows, candidate_name):
-
-    if not isinstance(rows, list):
-        return None, None, False
-
-    if not rows:
-        return None, {}, False
-
-    correct = 0
-
-    slice_rows = {}
-
-    for row in rows:
-
-        if not isinstance(row, dict):
-            return None, {}, False
-
-        if set(row.keys()) != {
-            "label",
-            "slice",
-            "predictions"
-        }:
-            return None, {}, False
-
-        label = row["label"]
-        slice_name = row["slice"]
-        predictions = row["predictions"]
-
-        if (
-            isinstance(label, bool)
-            or not isinstance(label, int)
-            or label not in (0, 1)
-        ):
-            return None, {}, False
-
-        if (
-            not isinstance(slice_name, str)
-            or slice_name == ""
-        ):
-            return None, {}, False
-
-        if not isinstance(
-            predictions,
-            dict
-        ):
-            return None, {}, False
-
-        if candidate_name not in predictions:
-            return None, {}, False
-
-        prediction = predictions[
-            candidate_name
-        ]
-
-        if (
-            isinstance(prediction, bool)
-            or not isinstance(prediction, int)
-            or prediction not in (0, 1)
-        ):
-            return None, {}, False
-
-        if prediction == label:
-            correct += 1
-
-        slice_rows.setdefault(
-            slice_name,
-            [0, 0]
-        )
-
-        slice_rows[slice_name][1] += 1
-
-        if prediction == label:
-            slice_rows[slice_name][0] += 1
-
-    aggregate = round(
-        correct / len(rows),
-        12
-    )
-
-    slices = {}
-
-    for name, counts in slice_rows.items():
-
-        slices[name] = round(
-            counts[0] / counts[1],
-            12
-        )
-
-    return aggregate, slices, True
-
-
-def quantize_select(body):
-
-    required = {
-        "phase",
-        "freezeId",
-        "candidates",
-        "policy",
-        "latencies",
-        "rows"
-    }
-
-    if (
-        not isinstance(body, dict)
-        or not required.issubset(body.keys())
-        or body.get("phase") != "select"
-    ):
-        return None
-
-    freeze_id = body["freezeId"]
-
-    if not isinstance(
-        freeze_id,
-        str
-    ):
-        return None
-
-    candidates = body["candidates"]
-
-    if not isinstance(candidates, list):
-        return None
-
-    rows = body["rows"]
-
-    if not isinstance(rows, list):
-        return None
-
-    policy = body["policy"]
-
-    if not isinstance(policy, dict):
-        return None
-
-    latencies = body["latencies"]
-
-    if not isinstance(latencies, dict):
-        return None
-
-    # --------------------------------------------------------
-    # Frozen lineage
-    # --------------------------------------------------------
-
-    frozen = QUANTIZE_FREEZES.get(
-        freeze_id
-    )
-
-    global_codes = []
-
-    if frozen is None:
-        global_codes.append(
-            "NOT_FROZEN"
-        )
-
-    # --------------------------------------------------------
-    # Validate policy.
-    # --------------------------------------------------------
-
-    policy_required = {
-        "maxBytes",
-        "aggregateFloor",
-        "requiredSlices",
-        "maxLatencyMs",
-        "candidateOrder"
-    }
-
-    policy_valid = (
-        set(policy.keys())
-        == policy_required
-    )
-
-    if not policy_valid:
-        global_codes.append(
-            "INVALID_POLICY"
-        )
-
-    if policy_valid:
-
-        if not quantize_safe_integer(
-            policy["maxBytes"]
-        ):
-            global_codes.append(
-                "INVALID_POLICY"
-            )
-
-        if not quantize_unit(
-            policy["aggregateFloor"]
-        ):
-            global_codes.append(
-                "INVALID_POLICY"
-            )
-
-        if not isinstance(
-            policy["requiredSlices"],
-            dict
-        ):
-            global_codes.append(
-                "INVALID_POLICY"
-            )
-        else:
-            for name, floor in (
-                policy["requiredSlices"].items()
-            ):
-                if (
-                    not isinstance(name, str)
-                    or name == ""
-                    or not quantize_unit(floor)
-                ):
-                    global_codes.append(
-                        "INVALID_POLICY"
-                    )
-
-        if not quantize_nonnegative_finite(
-            policy["maxLatencyMs"]
-        ):
-            global_codes.append(
-                "INVALID_POLICY"
-            )
-
-        if not quantize_unique_nonempty_strings(
-            policy["candidateOrder"]
-        ):
-            global_codes.append(
-                "INVALID_POLICY"
-            )
-
-    # --------------------------------------------------------
-    # Candidate list supplied with selection must equal the
-    # frozen candidate response.
-    # --------------------------------------------------------
-
-    supplied_valid = True
-
-    if frozen is not None:
-
-        stored_candidates = frozen[
-            "candidates"
-        ]
-
-        if candidates != stored_candidates:
-            global_codes.append(
-                "INVALID_LINEAGE"
-            )
-            supplied_valid = False
-
-        else:
-
-            for candidate in candidates:
-
-                if not quantize_validate_frozen_candidate(
-                    candidate
-                ):
-                    global_codes.append(
-                        "INVALID_MANIFEST"
-                    )
-                    supplied_valid = False
-
-    # Candidate names must equal candidateOrder.
-    if policy_valid:
-
-        order = policy[
-            "candidateOrder"
-        ]
-
-        supplied_names = [
-            c.get("name")
-            for c in candidates
-            if isinstance(c, dict)
-        ]
-
-        if (
-            len(set(supplied_names))
-            != len(supplied_names)
-            or set(supplied_names)
-            != set(order)
-        ):
-            global_codes.append(
-                "INVALID_POLICY"
-            )
-
-    # --------------------------------------------------------
-    # Validate latency map.
-    # --------------------------------------------------------
-
-    valid_latency_names = set()
-
-    for name, value in latencies.items():
-
-        if not isinstance(name, str):
-            global_codes.append(
-                "INVALID_POLICY"
-            )
+        if artifacts.get(parent) is not None:
+            parent = pipeline_parent(parent)
             continue
 
-        if not quantize_nonnegative_finite(
-            value
+        state = states.get(parent)
+
+        if state is None:
+            return True
+
+        if state.get("status") in (
+            "started",
+            "retryable_failed",
         ):
-            global_codes.append(
-                "INVALID_POLICY"
-            )
-            continue
+            return True
 
-        valid_latency_names.add(name)
+        parent = pipeline_parent(parent)
 
-    # --------------------------------------------------------
-    # Evaluate every frozen candidate.
-    # --------------------------------------------------------
+    return False
 
-    results_by_name = {}
 
-    if (
-        frozen is not None
-        and isinstance(candidates, list)
+def pipeline_ready(
+    node,
+    states,
+    artifacts,
+    keys
+):
+    if keys.get(node) is None:
+        return False
+
+    parent = pipeline_parent(node)
+
+    if parent is None:
+        return True
+
+    if artifacts.get(parent) is not None:
+        return True
+
+    return False
+
+
+def pipeline_state_for_key(
+    states,
+    node,
+    key
+):
+    state = states.get(node)
+
+    if state is None:
+        return None
+
+    if state.get("key") != key:
+        return None
+
+    return state
+
+
+def pipeline_event_canonical(event):
+    return pipeline_compact(event)
+
+
+def pipeline_valid_receipt(
+    node,
+    key,
+    receipt
+):
+    if node in (
+        "register",
+        "publish",
     ):
+        return receipt == (
+            f"receipt:{node}:{key}"
+        )
 
-        for candidate in candidates:
+    return receipt is None
 
-            name = candidate.get(
-                "name"
-            )
 
-            if not isinstance(name, str):
-                continue
+def pipeline_process_event(
+    session_state,
+    event,
+    current_revision,
+    keys,
+    artifacts,
+    states
+):
+    """
+    Returns:
+        "accepted"
+        "ignored"
+        or raises a conflict code.
+    """
 
-            codes = []
+    event_id = event["eventId"]
 
-            total_bytes = None
-            latency = None
+    # --------------------------------------------------------
+    # Revision
+    # --------------------------------------------------------
 
-            # ------------------------------------------------
-            # Manifest / lineage
-            # ------------------------------------------------
+    if event["revision"] != current_revision:
+        return "ignored"
 
-            manifest_valid = (
-                quantize_validate_frozen_candidate(
-                    candidate
-                )
-            )
+    node = event["node"]
 
-            if not manifest_valid:
-                codes.append(
-                    "INVALID_MANIFEST"
-                )
+    if node not in PIPELINE_DAG:
+        return "ignored"
 
-            else:
+    key = event["key"]
 
-                inventory_result = (
-                    quantize_inventory(
-                        candidate["inventory"]
-                    )
-                )
+    # Wrong/unavailable key.
+    if key != keys.get(node):
+        return "ignored"
 
-                if len(inventory_result) == 4:
-                    inventory, recomputed_bytes, recomputed_digest, valid = (
-                        inventory_result
-                    )
-                else:
-                    valid = False
-                    recomputed_bytes = None
-                    recomputed_digest = None
+    # Parent must be reusable.
+    parent = pipeline_parent(node)
 
-                if not valid:
-                    codes.append(
-                        "INVALID_MANIFEST"
-                    )
-                else:
+    if parent is not None:
 
-                    # Never trust submitted totalBytes.
-                    total_bytes = (
-                        recomputed_bytes
-                    )
+        parent_artifact = artifacts.get(parent)
 
-                    if (
-                        candidate["totalBytes"]
-                        != recomputed_bytes
-                        or candidate["packageDigest"]
-                        != recomputed_digest
-                    ):
-                        codes.append(
-                            "INVALID_MANIFEST"
-                        )
+        if parent_artifact is None:
+            return "ignored"
 
-            # ------------------------------------------------
-            # Candidate status
-            # ------------------------------------------------
+    # --------------------------------------------------------
+    # Attempt validation
+    # --------------------------------------------------------
 
-            if candidate.get("status") != "frozen":
-                codes.append(
-                    "INVALID_LINEAGE"
-                )
+    if not pipeline_safe_positive_integer(
+        event["attempt"]
+    ):
+        return "ignored"
 
-            # ------------------------------------------------
-            # Latency
-            # ------------------------------------------------
+    # --------------------------------------------------------
+    # Status
+    # --------------------------------------------------------
 
-            if name not in latencies:
+    if event["status"] not in PIPELINE_STATUS_VALUES:
+        return "ignored"
 
-                codes.append(
-                    "INVALID_POLICY"
-                )
+    # --------------------------------------------------------
+    # Artifact validation
+    # --------------------------------------------------------
 
-            else:
+    if event["status"] == "succeeded":
 
-                latency_value = latencies[name]
+        if not pipeline_valid_nonempty_string(
+            event["artifactDigest"]
+        ):
+            return "ignored"
 
-                if quantize_nonnegative_finite(
-                    latency_value
-                ):
-                    latency = latency_value
-                else:
-                    latency = None
-                    codes.append(
-                        "INVALID_POLICY"
-                    )
+    else:
 
-            # ------------------------------------------------
-            # Prediction validation + accuracy
-            # ------------------------------------------------
+        if event["artifactDigest"] is not None:
+            return "ignored"
 
-            aggregate = None
-            slices = {}
+    # --------------------------------------------------------
+    # Receipt validation
+    # --------------------------------------------------------
 
-            if not rows:
+    if not pipeline_valid_receipt(
+        node,
+        key,
+        event["receiptId"]
+    ):
+        return "ignored"
 
-                codes.append(
-                    "INVALID_PREDICTIONS"
-                )
+    current = pipeline_state_for_key(
+        states,
+        node,
+        key
+    )
 
-            else:
+    # --------------------------------------------------------
+    # No state for this key.
+    # --------------------------------------------------------
 
-                aggregate, slices, prediction_valid = (
-                    quantize_accuracy(
-                        rows,
-                        name
-                    )
-                )
+    if current is None:
 
-                if not prediction_valid:
-                    aggregate = None
-                    slices = {}
-                    codes.append(
-                        "INVALID_PREDICTIONS"
-                    )
-
-            # ------------------------------------------------
-            # Accuracy gates
-            # ------------------------------------------------
-
-            if (
-                aggregate is not None
-                and policy_valid
-                and aggregate
-                < policy["aggregateFloor"]
-            ):
-                codes.append(
-                    "AGGREGATE_FLOOR"
-                )
-
-            if (
-                policy_valid
-                and aggregate is not None
-            ):
-
-                for slice_name, floor in (
-                    policy["requiredSlices"].items()
-                ):
-
-                    if slice_name not in slices:
-
-                        codes.append(
-                            f"MISSING_SLICE:{slice_name}"
-                        )
-
-                    elif (
-                        slices[slice_name]
-                        < floor
-                    ):
-
-                        codes.append(
-                            f"SLICE_FLOOR:{slice_name}"
-                        )
-
-            # ------------------------------------------------
-            # Size + latency
-            # ------------------------------------------------
-
-            if (
-                total_bytes is not None
-                and policy_valid
-                and total_bytes
-                > policy["maxBytes"]
-            ):
-                codes.append(
-                    "SIZE_LIMIT"
-                )
-
-            if (
-                latency is not None
-                and policy_valid
-                and latency
-                > policy["maxLatencyMs"]
-            ):
-                codes.append(
-                    "LATENCY_LIMIT"
-                )
-
-            codes = sorted_codes(codes)
-
-            results_by_name[name] = {
-                "name": name,
-                "aggregate": aggregate,
-                "slices": slices,
-                "totalBytes": total_bytes,
-                "latencyMs": latency,
-                "admitted": (
-                    len(codes) == 0
-                ),
-                "reasonCodes": codes
+        if (
+            event["status"] == "started"
+            and event["attempt"] == 1
+        ):
+            states[node] = {
+                "key": key,
+                "status": "started",
+                "attempt": 1,
+                "artifactDigest": None,
+                "eventId": event_id,
             }
 
-    # --------------------------------------------------------
-    # Result ordering: candidateOrder first.
-    # UTF-8 name is fallback.
-    # --------------------------------------------------------
+            return "accepted"
 
-    if policy_valid:
-        order = policy[
-            "candidateOrder"
-        ]
-    else:
-        order = []
+        # Completion or attempt > 1 without the
+        # initial start is ignored.
+        return "ignored"
 
-    order_index = {
-        name: i
-        for i, name in enumerate(order)
-    }
-
-    results = sorted(
-        results_by_name.values(),
-        key=lambda x: (
-            order_index.get(
-                x["name"],
-                len(order)
-            ),
-            utf8(x["name"])
-        )
-    )
+    previous_status = current["status"]
+    previous_attempt = current["attempt"]
 
     # --------------------------------------------------------
-    # Winner:
-    # smaller bytes,
-    # lower latency,
-    # candidate order.
+    # Successful/current cache state.
     # --------------------------------------------------------
 
-    admitted = [
-        result
-        for result in results
-        if result["admitted"]
-    ]
+    if previous_status == "succeeded":
 
-    if admitted:
+        if event["status"] == "succeeded":
 
-        winner = min(
-            admitted,
-            key=lambda result: (
-                result["totalBytes"],
-                result["latencyMs"],
-                order_index.get(
-                    result["name"],
-                    len(order)
+            if (
+                event["artifactDigest"]
+                != current["artifactDigest"]
+            ):
+                raise ValueError(
+                    "EVIDENCE_CONFLICT"
                 )
+
+            return "ignored"
+
+        raise ValueError(
+            "STATUS_CONFLICT"
+        )
+
+    # --------------------------------------------------------
+    # Terminal state.
+    # --------------------------------------------------------
+
+    if previous_status == "terminal_failed":
+        raise ValueError(
+            "STATUS_CONFLICT"
+        )
+
+    # --------------------------------------------------------
+    # Started state.
+    # --------------------------------------------------------
+
+    if previous_status == "started":
+
+        if (
+            event["attempt"] < previous_attempt
+        ):
+            return "ignored"
+
+        if (
+            event["attempt"] == previous_attempt
+            and event["status"] in (
+                "succeeded",
+                "retryable_failed",
+                "terminal_failed",
+            )
+        ):
+            if event["status"] == "succeeded":
+
+                states[node] = {
+                    "key": key,
+                    "status": "succeeded",
+                    "attempt": previous_attempt,
+                    "artifactDigest":
+                        event["artifactDigest"],
+                    "eventId": event_id,
+                }
+
+                # Immutable evidence.
+                old_artifact = artifacts.get(
+                    node
+                )
+
+                if (
+                    old_artifact is not None
+                    and old_artifact
+                    != event["artifactDigest"]
+                ):
+                    raise ValueError(
+                        "EVIDENCE_CONFLICT"
+                    )
+
+                artifacts[node] = (
+                    event["artifactDigest"]
+                )
+
+            elif event["status"] == "retryable_failed":
+
+                states[node] = {
+                    "key": key,
+                    "status":
+                        "retryable_failed",
+                    "attempt":
+                        previous_attempt,
+                    "artifactDigest": None,
+                    "eventId": event_id,
+                }
+
+            else:
+
+                states[node] = {
+                    "key": key,
+                    "status":
+                        "terminal_failed",
+                    "attempt":
+                        previous_attempt,
+                    "artifactDigest": None,
+                    "eventId": event_id,
+                }
+
+            return "accepted"
+
+        # started -> started at same attempt is not a valid
+        # transition.
+        if (
+            event["attempt"] == previous_attempt
+            and event["status"] == "started"
+        ):
+            raise ValueError(
+                "STATUS_CONFLICT"
+            )
+
+        if (
+            event["attempt"] > previous_attempt
+        ):
+            raise ValueError(
+                "STATUS_CONFLICT"
+            )
+
+        return "ignored"
+
+    # --------------------------------------------------------
+    # Retryable failure.
+    # --------------------------------------------------------
+
+    if previous_status == "retryable_failed":
+
+        if (
+            event["attempt"]
+            < previous_attempt
+        ):
+            return "ignored"
+
+        if (
+            event["attempt"]
+            == previous_attempt + 1
+            and event["status"] == "started"
+        ):
+            states[node] = {
+                "key": key,
+                "status": "started",
+                "attempt":
+                    event["attempt"],
+                "artifactDigest": None,
+                "eventId": event_id,
+            }
+
+            return "accepted"
+
+        if (
+            event["attempt"]
+            > previous_attempt
+        ):
+            raise ValueError(
+                "STATUS_CONFLICT"
+            )
+
+        raise ValueError(
+            "STATUS_CONFLICT"
+        )
+
+    return "ignored"
+
+
+def pipeline_build_nodes(
+    inputs,
+    states,
+    artifacts,
+    keys
+):
+    nodes = []
+
+    for node in PIPELINE_DAG:
+
+        key = keys.get(node)
+
+        state = pipeline_state_for_key(
+            states,
+            node,
+            key
+        )
+
+        dependency_digests = (
+            pipeline_dependency_digests(
+                node,
+                inputs,
+                key,
+                artifacts
             )
         )
 
-        selected = winner["name"]
+        triggering = []
 
-        package_manifest = winner.copy()
+        if state is not None:
+            triggering = [
+                state["eventId"]
+            ]
 
-    else:
+        # ----------------------------------------------------
+        # Cached
+        # ----------------------------------------------------
 
-        selected = None
-        package_manifest = None
+        if (
+            key is not None
+            and artifacts.get(node) is not None
+        ):
 
-    global_codes = sorted_codes(
-        global_codes
-    )
+            nodes.append({
+                "node": node,
+                "action": "reuse",
+                "reasonCodes": [
+                    "CACHE_HIT"
+                ],
+                "dependencyDigests":
+                    dependency_digests,
+                "triggeringEventIds":
+                    triggering,
+            })
 
-    # A global failure means no candidate can be selected.
-    if global_codes:
-        selected = None
-        package_manifest = None
+            continue
 
-    return {
-        "freezeId": freeze_id,
-        "selected": selected,
-        "results": results,
-        "packageManifest": package_manifest,
-    }
+        # ----------------------------------------------------
+        # Terminal
+        # ----------------------------------------------------
+
+        if (
+            state is not None
+            and state["status"]
+            == "terminal_failed"
+        ):
+
+            nodes.append({
+                "node": node,
+                "action": "block",
+                "reasonCodes": [
+                    "TERMINAL_FAILURE"
+                ],
+                "dependencyDigests":
+                    dependency_digests,
+                "triggeringEventIds":
+                    triggering,
+            })
+
+            continue
+
+        # ----------------------------------------------------
+        # Upstream terminal.
+        # ----------------------------------------------------
+
+        if pipeline_descendants_have_terminal(
+            node,
+            states
+        ):
+
+            nodes.append({
+                "node": node,
+                "action": "block",
+                "reasonCodes": [
+                    "UPSTREAM_TERMINAL"
+                ],
+                "dependencyDigests":
+                    dependency_digests,
+                "triggeringEventIds": [],
+            })
+
+            continue
+
+        # ----------------------------------------------------
+        # Running.
+        # ----------------------------------------------------
+
+        if (
+            state is not None
+            and state["status"] == "started"
+        ):
+
+            nodes.append({
+                "node": node,
+                "action": "block",
+                "reasonCodes": [
+                    "RUNNING"
+                ],
+                "dependencyDigests":
+                    dependency_digests,
+                "triggeringEventIds":
+                    triggering,
+            })
+
+            continue
+
+        # ----------------------------------------------------
+        # Retryable failure.
+        # ----------------------------------------------------
+
+        if (
+            state is not None
+            and state["status"]
+            == "retryable_failed"
+        ):
+
+            if pipeline_ready(
+                node,
+                states,
+                artifacts,
+                keys
+            ):
+
+                nodes.append({
+                    "node": node,
+                    "action": "rerun",
+                    "reasonCodes": [
+                        "RETRYABLE_FAILURE"
+                    ],
+                    "dependencyDigests":
+                        dependency_digests,
+                    "triggeringEventIds":
+                        triggering,
+                })
+
+            else:
+
+                nodes.append({
+                    "node": node,
+                    "action": "block",
+                    "reasonCodes": [
+                        "UPSTREAM_PENDING"
+                    ],
+                    "dependencyDigests":
+                        dependency_digests,
+                    "triggeringEventIds": [],
+                })
+
+            continue
+
+        # ----------------------------------------------------
+        # Ready without cache.
+        # ----------------------------------------------------
+
+        if pipeline_ready(
+            node,
+            states,
+            artifacts,
+            keys
+        ):
+
+            nodes.append({
+                "node": node,
+                "action": "rerun",
+                "reasonCodes": [
+                    "CACHE_MISS"
+                ],
+                "dependencyDigests":
+                    dependency_digests,
+                "triggeringEventIds": [],
+            })
+
+            continue
+
+        # ----------------------------------------------------
+        # Pending upstream.
+        # ----------------------------------------------------
+
+        nodes.append({
+            "node": node,
+            "action": "block",
+            "reasonCodes": [
+                "UPSTREAM_PENDING"
+            ],
+            "dependencyDigests":
+                dependency_digests,
+            "triggeringEventIds": [],
+        })
+
+    return nodes
 
 
-# ============================================================
-# /quantize
-# ============================================================
+@app.route("/pipeline", methods=["POST"])
+def pipeline():
 
-@app.route("/quantize", methods=["POST"])
-def quantize():
+    # --------------------------------------------------------
+    # JSON request
+    # --------------------------------------------------------
 
     if not request.is_json:
         return app.response_class(
-            response='{"error":"INVALID_INPUT"}',
-            status=400,
+            response='{"error":"INVALID_REQUEST"}',
+            status=409,
             mimetype="application/json"
         )
 
@@ -4656,115 +4321,341 @@ def quantize():
         body = request.get_json()
     except Exception:
         return app.response_class(
-            response='{"error":"INVALID_INPUT"}',
-            status=400,
+            response='{"error":"INVALID_REQUEST"}',
+            status=409,
             mimetype="application/json"
         )
 
     if not isinstance(body, dict):
         return app.response_class(
-            response='{"error":"INVALID_INPUT"}',
-            status=400,
+            response='{"error":"INVALID_REQUEST"}',
+            status=409,
             mimetype="application/json"
         )
 
-    phase = body.get("phase")
+    # --------------------------------------------------------
+    # Required request fields
+    # --------------------------------------------------------
 
-    if phase not in (
-        "freeze",
-        "select"
+    required = {
+        "session",
+        "revision",
+        "inputs",
+        "events",
+    }
+
+    if not required.issubset(body.keys()):
+        return app.response_class(
+            response='{"error":"INVALID_REQUEST"}',
+            status=409,
+            mimetype="application/json"
+        )
+
+    session = body["session"]
+    revision = body["revision"]
+    inputs = body["inputs"]
+    events = body["events"]
+
+    if not pipeline_valid_nonempty_string(
+        session
     ):
         return app.response_class(
-            response='{"error":"INVALID_INPUT"}',
-            status=400,
+            response='{"error":"INVALID_REQUEST"}',
+            status=409,
+            mimetype="application/json"
+        )
+
+    if not pipeline_safe_positive_integer(
+        revision
+    ):
+        return app.response_class(
+            response='{"error":"INVALID_REQUEST"}',
+            status=409,
+            mimetype="application/json"
+        )
+
+    if not isinstance(inputs, dict):
+        return app.response_class(
+            response='{"error":"INVALID_REQUEST"}',
+            status=409,
+            mimetype="application/json"
+        )
+
+    if not isinstance(events, list):
+        return app.response_class(
+            response='{"error":"INVALID_REQUEST"}',
+            status=409,
             mimetype="application/json"
         )
 
     # --------------------------------------------------------
-    # FREEZE
+    # Inputs: exactly the required twelve must exist.
+    # Extra metadata is allowed.
     # --------------------------------------------------------
 
-    if phase == "freeze":
+    for name in PIPELINE_INPUT_NAMES:
 
-        result = quantize_freeze(body)
-
-        if result is None:
-            return app.response_class(
-                response='{"error":"INVALID_INPUT"}',
-                status=400,
-                mimetype="application/json"
+        if (
+            name not in inputs
+            or not pipeline_valid_nonempty_string(
+                inputs[name]
             )
-
-        freeze_id = result[
-            "freezeId"
-        ]
-
-        # Deterministic fingerprint of the entire
-        # freeze input.
-        fingerprint = hashlib.sha256(
-            json.dumps(
-                body,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True
-            ).encode("utf-8")
-        ).hexdigest()
-
-        existing = QUANTIZE_FREEZES.get(
-            freeze_id
-        )
-
-        if existing is not None:
-
-            if (
-                existing["fingerprint"]
-                == fingerprint
-            ):
-                return app.response_class(
-                    response=existing[
-                        "response_json"
-                    ],
-                    status=200,
-                    mimetype="application/json"
-                )
-
+        ):
             return app.response_class(
-                response='{"error":"FREEZE_ID_CONFLICT"}',
+                response='{"error":"INVALID_REQUEST"}',
                 status=409,
                 mimetype="application/json"
             )
 
-        response_json = compact_json(
-            result
-        )
+    # --------------------------------------------------------
+    # Session state
+    # --------------------------------------------------------
 
-        QUANTIZE_FREEZES[freeze_id] = {
-            "fingerprint": fingerprint,
-            "response": result,
-            "response_json": response_json
+    state = PIPELINE_STATES.get(
+        session
+    )
+
+    # --------------------------------------------------------
+    # New session
+    # --------------------------------------------------------
+
+    if state is None:
+
+        state = {
+            "revision": revision,
+            "input_canonical": pipeline_compact(
+                inputs
+            ),
+            "inputs": dict(inputs),
+            "artifacts": {},
+            "states": {},
+            "events": {},
         }
 
-        return app.response_class(
-            response=response_json,
-            status=200,
-            mimetype="application/json"
-        )
+        PIPELINE_STATES[session] = state
 
     # --------------------------------------------------------
-    # SELECT
+    # Revision handling
     # --------------------------------------------------------
 
-    result = quantize_select(body)
+    elif revision < state["revision"]:
 
-    if result is None:
-        return app.response_class(
-            response='{"error":"INVALID_INPUT"}',
-            status=400,
-            mimetype="application/json"
+        # Old well-formed events are ignored, but a whole
+        # request for an old revision is a request conflict
+        # because its inputs are not the current revision.
+        if (
+            revision != state["revision"]
+        ):
+            return app.response_class(
+                response='{"error":"REVISION_CONFLICT"}',
+                status=409,
+                mimetype="application/json"
+            )
+
+    elif revision == state["revision"]:
+
+        # Same revision must have exactly identical inputs,
+        # including extra metadata.
+        if (
+            pipeline_compact(inputs)
+            != state["input_canonical"]
+        ):
+            return app.response_class(
+                response='{"error":"REVISION_CONFLICT"}',
+                status=409,
+                mimetype="application/json"
+            )
+
+    else:
+        # New revision.
+        #
+        # Successful content-addressed cache entries survive,
+        # but attempt/terminal state is cleared.
+        state["revision"] = revision
+        state["input_canonical"] = (
+            pipeline_compact(inputs)
         )
+        state["inputs"] = dict(inputs)
+        state["states"] = {}
+        state["events"] = {}
+
+    # --------------------------------------------------------
+    # Work on a complete copy so the entire event batch is
+    # atomic.
+    # --------------------------------------------------------
+
+    import copy
+
+    working_states = copy.deepcopy(
+        state["states"]
+    )
+
+    working_artifacts = copy.deepcopy(
+        state["artifacts"]
+    )
+
+    working_events = copy.deepcopy(
+        state["events"]
+    )
+
+    # --------------------------------------------------------
+    # Recompute current keys from reusable artifacts.
+    # --------------------------------------------------------
+
+    keys = pipeline_make_keys(
+        inputs,
+        working_artifacts
+    )
+
+    accepted = []
+    ignored = []
+
+    # --------------------------------------------------------
+    # Validate/process event batch in input order.
+    # --------------------------------------------------------
+
+    batch_event_ids = set()
+
+    for event in events:
+
+        # Every event must contain exactly the eight fields.
+        if not pipeline_event_shape(event):
+            return app.response_class(
+                response='{"error":"INVALID_EVENT"}',
+                status=409,
+                mimetype="application/json"
+            )
+
+        event_id = event["eventId"]
+
+        if not pipeline_valid_nonempty_string(
+            event_id
+        ):
+            return app.response_class(
+                response='{"error":"INVALID_EVENT"}',
+                status=409,
+                mimetype="application/json"
+            )
+
+        # Canonical event representation.
+        canonical_event = (
+            pipeline_event_canonical(event)
+        )
+
+        # ----------------------------------------------------
+        # Existing event ID.
+        # ----------------------------------------------------
+
+        if event_id in working_events:
+
+            if (
+                working_events[event_id]
+                == canonical_event
+            ):
+                ignored.append(event_id)
+                continue
+
+            # Same ID but different event.
+            return app.response_class(
+                response='{"error":"EVENT_ID_CONFLICT"}',
+                status=409,
+                mimetype="application/json"
+            )
+
+        # Duplicate ID within the same batch.
+        if event_id in batch_event_ids:
+            return app.response_class(
+                response='{"error":"EVENT_ID_CONFLICT"}',
+                status=409,
+                mimetype="application/json"
+            )
+
+        batch_event_ids.add(event_id)
+
+        # ----------------------------------------------------
+        # Process event.
+        # ----------------------------------------------------
+
+        try:
+
+            result = pipeline_process_event(
+                state,
+                event,
+                revision,
+                keys,
+                working_artifacts,
+                working_states
+            )
+
+        except ValueError as exc:
+
+            code = str(exc)
+
+            if code in (
+                "EVIDENCE_CONFLICT",
+                "STATUS_CONFLICT",
+            ):
+                return app.response_class(
+                    response=compact_json({
+                        "error": code
+                    }),
+                    status=409,
+                    mimetype="application/json"
+                )
+
+            return app.response_class(
+                response='{"error":"INVALID_EVENT"}',
+                status=409,
+                mimetype="application/json"
+            )
+
+        if result == "accepted":
+
+            accepted.append(event_id)
+
+            working_events[event_id] = (
+                canonical_event
+            )
+
+        else:
+
+            ignored.append(event_id)
+
+    # --------------------------------------------------------
+    # Recompute keys after processing successful events.
+    # --------------------------------------------------------
+
+    keys = pipeline_make_keys(
+        inputs,
+        working_artifacts
+    )
+
+    # --------------------------------------------------------
+    # Commit atomically.
+    # --------------------------------------------------------
+
+    state["states"] = working_states
+    state["artifacts"] = working_artifacts
+    state["events"] = working_events
+
+    # --------------------------------------------------------
+    # Build deterministic response.
+    # --------------------------------------------------------
+
+    nodes = pipeline_build_nodes(
+        inputs,
+        working_states,
+        working_artifacts,
+        keys
+    )
 
     return app.response_class(
-        response=compact_json(result),
+        response=compact_json({
+            "revision": revision,
+            "acceptedEventIds": accepted,
+            "ignoredEventIds": ignored,
+            "nodes": nodes,
+        }),
         status=200,
         mimetype="application/json"
     )
