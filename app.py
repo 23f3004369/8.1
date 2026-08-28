@@ -1078,59 +1078,36 @@ def bqml_valid_digest(value):
 
 
 def bqml_selection_row_valid(row):
-    """
-    Validate the structural contents of one selection row.
-
-    IMPORTANT:
-    availableAt being later than predictionTime does NOT
-    invalidate the row. It only makes that feature ineligible.
-
-    Feature values are opaque data and may be any JSON value.
-    """
+    """Validate one select-phase row exactly as specified."""
 
     if not isinstance(row, dict):
         return False
 
-    if not {
+    if set(row.keys()) != {
         "id",
         "entity",
         "eventTime",
         "predictionTime",
         "version",
         "split",
-        "features"
-    }.issubset(row.keys()):
+        "features",
+    }:
         return False
-
-    # --------------------------------------------------------
-    # Basic row fields
-    # --------------------------------------------------------
 
     if not isinstance(row["id"], str):
         return False
-
     if not isinstance(row["entity"], str):
         return False
-
     if not isinstance(row["eventTime"], str):
         return False
-
     if not isinstance(row["predictionTime"], str):
         return False
-
     if not bqml_safe_integer(row["version"]):
         return False
-
     if row["split"] not in ("TRAIN", "EVAL"):
         return False
-
     if not isinstance(row["features"], dict):
         return False
-
-    # --------------------------------------------------------
-    # eventTime and predictionTime must both be valid
-    # timestamps.
-    # --------------------------------------------------------
 
     try:
         parse_timestamp(row["eventTime"])
@@ -1138,189 +1115,138 @@ def bqml_selection_row_valid(row):
     except Exception:
         return False
 
-    # --------------------------------------------------------
-    # Validate feature structure.
-    #
-    # DO NOT check availableAt <= predictionTime here.
-    # That is an eligibility rule, not a row-validation rule.
-    #
-    # DO NOT require feature["value"] to be a string.
-    # It is opaque data.
-    # --------------------------------------------------------
-
     for feature_name, feature in row["features"].items():
-
-        # JSON object keys are strings, but keep the explicit
-        # check for deterministic validation.
         if not isinstance(feature_name, str):
             return False
 
         if not isinstance(feature, dict):
             return False
 
-        if not {
-            "value",
-            "availableAt"
-        }.issubset(feature.keys()):
+        if set(feature.keys()) != {"value", "availableAt"}:
             return False
 
-        # Feature value is intentionally NOT type-restricted.
-        # It is data.
+        # The example schema defines value as text. It is opaque
+        # data: never evaluate it as code or instructions.
+        if not isinstance(feature["value"], str):
+            return False
 
-        if not isinstance(
-            feature["availableAt"],
-            str
-        ):
+        if not isinstance(feature["availableAt"], str):
             return False
 
         try:
-            parse_timestamp(
-                feature["availableAt"]
-            )
+            parse_timestamp(feature["availableAt"])
         except Exception:
             return False
 
+    # IMPORTANT: a future availableAt does NOT invalidate the row.
+    # It only makes that feature ineligible later.
     return True
 
 
 def bqml_deduplicate_rows(rows):
-    """
-    Deduplicate by [entity, UTC(eventTime)].
-
-    Keep:
-      1. highest version
-      2. UTF-8-byte-smallest ID
-    """
+    """Deduplicate by [entity, UTC(eventTime)]."""
 
     groups = {}
 
     for row in rows:
-        event_dt = parse_timestamp(row["eventTime"])
-
-        key = (
-            row["entity"],
-            event_dt
-        )
-
+        event_time_utc = parse_timestamp(row["eventTime"])
+        key = (row["entity"], event_time_utc)
         groups.setdefault(key, []).append(row)
 
     retained = []
 
     for group in groups.values():
-
         winner = min(
             group,
             key=lambda row: (
                 -row["version"],
-                utf8(row["id"])
-            )
+                utf8(row["id"]),
+            ),
         )
-
         retained.append(winner)
 
     return retained
 
 
-def bqml_eligible_features(rows, forbidden):
-    """
-    Feature eligibility is determined AFTER row validation
-    and AFTER deduplication.
-
-    A feature is eligible only if:
-
-      1. It appears in every retained row.
-      2. It is not forbidden.
-      3. In every retained row:
-             availableAt <= predictionTime
-
-    Feature names are sorted by UTF-8 bytes.
-    """
+def bqml_eligible_features(rows, forbidden_features):
+    """Compute features shared and point-in-time safe for all retained rows."""
 
     if not rows:
         return []
 
-    # --------------------------------------------------------
-    # Feature must occur in EVERY retained row.
-    # --------------------------------------------------------
-
-    common_features = set(
-        rows[0]["features"].keys()
-    )
+    common = set(rows[0]["features"].keys())
 
     for row in rows[1:]:
-        common_features.intersection_update(
-            row["features"].keys()
-        )
+        common.intersection_update(row["features"].keys())
 
     eligible = []
 
-    # --------------------------------------------------------
-    # Apply forbidden + point-in-time conditions.
-    # --------------------------------------------------------
-
-    for feature_name in common_features:
-
-        if feature_name in forbidden:
+    for name in common:
+        if name in forbidden_features:
             continue
 
-        available_for_all = True
+        okay = True
 
         for row in rows:
-
             available_at = parse_timestamp(
-                row["features"][
-                    feature_name
-                ]["availableAt"]
+                row["features"][name]["availableAt"]
             )
-
             prediction_time = parse_timestamp(
                 row["predictionTime"]
             )
 
             if available_at > prediction_time:
-                available_for_all = False
+                okay = False
                 break
 
-        if available_for_all:
-            eligible.append(feature_name)
+        if okay:
+            eligible.append(name)
 
-    # --------------------------------------------------------
-    # Required UTF-8-byte ordering.
-    # --------------------------------------------------------
-
-    return sorted(
-        eligible,
-        key=utf8
-    )
+    return sorted(eligible, key=utf8)
 
 
-def bqml_trial_shape_valid(trial):
+def bqml_trial_valid(trial):
+    """Validate the complete trial object."""
+
     if not isinstance(trial, dict):
         return False
-    if not {"trialId", "status", "evalMetric"}.issubset(trial.keys()):
+
+    if set(trial.keys()) != {
+        "trialId",
+        "status",
+        "evalMetric",
+    }:
         return False
+
     if not bqml_safe_integer(trial["trialId"]):
         return False
+
     if trial["status"] not in ("SUCCEEDED", "FAILED"):
         return False
-    # Only SUCCEEDED trials need a finite metric to be eligible.
-    # FAILED trial metrics are irrelevant to eligibility.
+
+    # A FAILED trial is never eligible, so its metric does not
+    # participate in selection. A SUCCEEDED trial is eligible
+    # only when its metric is finite.
     return True
 
 
-def bqml_successful_trial_eligible(trial):
+def bqml_trial_eligible(trial):
     return (
         trial["status"] == "SUCCEEDED"
-        and bqml_finite_number(
-            trial["evalMetric"]
-        )
+        and bqml_finite_number(trial["evalMetric"])
     )
 
 
 def bqml_selection_fingerprint(body):
-    return hashlib.sha256(
-        compact_json(body).encode("utf-8")
-    ).hexdigest()
+    # JSON object ordering is not meaningful input ordering. Use
+    # sorted keys so an otherwise identical replay is identical.
+    canonical = json.dumps(
+        body,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def bqml_select(body):
@@ -1331,12 +1257,12 @@ def bqml_select(body):
         "forbiddenFeatures",
         "numTrialsLimit",
         "rows",
-        "trials"
+        "trials",
     }
 
     if (
         not isinstance(body, dict)
-        or not required.issubset(body.keys())
+        or set(body.keys()) != required
         or body.get("phase") != "select"
     ):
         return None, None
@@ -1347,7 +1273,7 @@ def bqml_select(body):
 
     if (
         not isinstance(run_id, str)
-        or not run_id
+        or run_id == ""
         or len(run_id) > 128
     ):
         codes.append("INVALID_INPUT")
@@ -1357,10 +1283,7 @@ def bqml_select(body):
     if not isinstance(forbidden, list):
         codes.append("INVALID_INPUT")
         forbidden = []
-    elif any(
-        not isinstance(x, str)
-        for x in forbidden
-    ):
+    elif any(not isinstance(x, str) for x in forbidden):
         codes.append("INVALID_INPUT")
 
     limit = body["numTrialsLimit"]
@@ -1373,10 +1296,7 @@ def bqml_select(body):
 
     rows = body["rows"]
 
-    if (
-        not isinstance(rows, list)
-        or len(rows) == 0
-    ):
+    if not isinstance(rows, list) or len(rows) == 0:
         codes.append("INVALID_INPUT")
 
     trials = body["trials"]
@@ -1386,44 +1306,39 @@ def bqml_select(body):
         trials = []
 
     valid_rows = []
-    seen_ids = set()
+    row_ids = set()
 
     if isinstance(rows, list):
-
         for row in rows:
-
             if not bqml_selection_row_valid(row):
                 codes.append("INVALID_INPUT")
                 continue
 
-            if row["id"] in seen_ids:
+            if row["id"] in row_ids:
                 codes.append("INVALID_INPUT")
                 continue
 
-            seen_ids.add(row["id"])
+            row_ids.add(row["id"])
             valid_rows.append(row)
 
-    valid_trials = []
-    seen_trial_ids = set()
+    eligible_trials = []
+    trial_ids = set()
 
     for trial in trials:
-
-        if not bqml_trial_shape_valid(trial):
+        if not bqml_trial_valid(trial):
             codes.append("INVALID_INPUT")
             continue
 
         trial_id = trial["trialId"]
 
-        if trial_id in seen_trial_ids:
+        if trial_id in trial_ids:
             codes.append("INVALID_INPUT")
             continue
 
-        seen_trial_ids.add(trial_id)
+        trial_ids.add(trial_id)
 
-        # FAILED trials are structurally valid regardless of
-        # metric value. Only finite SUCCEEDED trials compete.
-        if bqml_successful_trial_eligible(trial):
-            valid_trials.append(trial)
+        if bqml_trial_eligible(trial):
+            eligible_trials.append(trial)
 
     if (
         bqml_safe_integer(limit)
@@ -1434,29 +1349,21 @@ def bqml_select(body):
 
     codes = sorted_codes(codes)
 
+    # Any selection error means selectedTrialId is null and the
+    # dataset digest is null.
     if codes:
-
         response = {
-            "runId": (
-                run_id
-                if isinstance(run_id, str)
-                else ""
-            ),
+            "runId": run_id if isinstance(run_id, str) else "",
             "selectedTrialId": None,
             "trainRowIds": [],
             "evalRowIds": [],
             "featureNames": [],
             "datasetDigest": None,
-            "reasonCodes": codes
+            "reasonCodes": codes,
         }
+        return response, bqml_selection_fingerprint(body)
 
-        return (
-            response,
-            bqml_selection_fingerprint(body)
-        )
-
-    if not valid_trials:
-
+    if not eligible_trials:
         response = {
             "runId": run_id,
             "selectedTrialId": None,
@@ -1464,64 +1371,46 @@ def bqml_select(body):
             "evalRowIds": [],
             "featureNames": [],
             "datasetDigest": None,
-            "reasonCodes": [
-                "NO_SUCCESSFUL_TRIAL"
-            ]
+            "reasonCodes": ["NO_SUCCESSFUL_TRIAL"],
         }
+        return response, bqml_selection_fingerprint(body)
 
-        return (
-            response,
-            bqml_selection_fingerprint(body)
-        )
-
-    # Deduplicate first. Feature eligibility is based on
-    # the retained rows, not the raw rows.
-    retained = bqml_deduplicate_rows(
-        valid_rows
-    )
+    # Deduplication happens before feature eligibility and split
+    # IDs are calculated from the retained rows only.
+    retained = bqml_deduplicate_rows(valid_rows)
 
     feature_names = bqml_eligible_features(
         retained,
-        set(forbidden)
+        set(forbidden),
     )
 
     train_ids = sorted(
-        [
-            row["id"]
-            for row in retained
-            if row["split"] == "TRAIN"
-        ],
-        key=utf8
+        [row["id"] for row in retained if row["split"] == "TRAIN"],
+        key=utf8,
     )
 
     eval_ids = sorted(
-        [
-            row["id"]
-            for row in retained
-            if row["split"] == "EVAL"
-        ],
-        key=utf8
+        [row["id"] for row in retained if row["split"] == "EVAL"],
+        key=utf8,
     )
 
-    # Maximize evalMetric; exact tie -> smallest integer ID.
+    # Highest finite SUCCEEDED metric; exact tie -> smallest integer ID.
     selected = min(
-        valid_trials,
+        eligible_trials,
         key=lambda trial: (
             -float(trial["evalMetric"]),
-            trial["trialId"]
-        )
+            trial["trialId"],
+        ),
     )
 
-    digest_payload = {
+    digest_input = {
         "trainRowIds": train_ids,
         "evalRowIds": eval_ids,
-        "featureNames": feature_names
+        "featureNames": feature_names,
     }
 
     dataset_digest = hashlib.sha256(
-        compact_json(
-            digest_payload
-        ).encode("utf-8")
+        compact_json(digest_input).encode("utf-8")
     ).hexdigest()
 
     response = {
@@ -1531,24 +1420,21 @@ def bqml_select(body):
         "evalRowIds": eval_ids,
         "featureNames": feature_names,
         "datasetDigest": dataset_digest,
-        "reasonCodes": []
+        "reasonCodes": [],
     }
 
-    return (
-        response,
-        bqml_selection_fingerprint(body)
-    )
+    return response, bqml_selection_fingerprint(body)
 
 
 def bqml_test_row_valid(row):
     if not isinstance(row, dict):
         return False
 
-    if not {
+    if set(row.keys()) != {
         "label",
         "prediction",
-        "slice"
-    }.issubset(row.keys()):
+        "slice",
+    }:
         return False
 
     if (
@@ -1585,22 +1471,26 @@ def bqml_evaluate(body):
         "requiredSlices",
         "rows",
         "bytesProcessed",
-        "maxBytes"
+        "maxBytes",
     }
 
     if (
         not isinstance(body, dict)
-        or not required.issubset(body.keys())
+        or set(body.keys()) != required
         or body.get("phase") != "evaluate"
     ):
         return {
-            "runId": (
-                body.get("runId", "")
+            "runId": body.get("runId", "") if isinstance(body, dict) else "",
+            "selectedTrialId": (
+                body.get("selectedTrialId")
                 if isinstance(body, dict)
-                else ""
+                else None
             ),
-            "selectedTrialId": None,
-            "datasetDigest": None,
+            "datasetDigest": (
+                body.get("datasetDigest")
+                if isinstance(body, dict)
+                else None
+            ),
             "testMetric": None,
             "criticalSlicePass": False,
             "decision": "reject",
@@ -1609,7 +1499,7 @@ def bqml_evaluate(body):
                 if isinstance(body, dict)
                 else 0
             ),
-            "reasonCodes": ["INVALID_INPUT"]
+            "reasonCodes": ["INVALID_INPUT"],
         }
 
     run_id = body["runId"]
@@ -1625,25 +1515,18 @@ def bqml_evaluate(body):
 
     if (
         not isinstance(run_id, str)
-        or not run_id
+        or run_id == ""
         or len(run_id) > 128
     ):
         codes.append("INVALID_INPUT")
 
-    # Evaluation specifically requires a non-null selected integer.
-    if not bqml_safe_integer(
-        selected_trial_id
-    ):
+    if not bqml_safe_integer(selected_trial_id):
         codes.append("INVALID_INPUT")
 
-    if not bqml_valid_digest(
-        dataset_digest
-    ):
+    if not bqml_valid_digest(dataset_digest):
         codes.append("INVALID_INPUT")
 
-    if not bqml_finite_unit(
-        metric_floor
-    ):
+    if not bqml_finite_unit(metric_floor):
         codes.append("INVALID_INPUT")
 
     if not isinstance(required_slices, dict):
@@ -1651,131 +1534,98 @@ def bqml_evaluate(body):
         required_slices = {}
     else:
         for name, floor in required_slices.items():
-
             if not isinstance(name, str):
                 codes.append("INVALID_INPUT")
                 continue
-
             if not bqml_finite_unit(floor):
                 codes.append("INVALID_INPUT")
 
     if not isinstance(rows, list):
         codes.append("INVALID_INPUT")
 
-    if not bqml_safe_integer(
-        bytes_processed
-    ):
+    if not bqml_safe_integer(bytes_processed):
         codes.append("INVALID_INPUT")
 
-    if not bqml_safe_integer(
-        max_bytes
-    ):
+    if not bqml_safe_integer(max_bytes):
         codes.append("INVALID_INPUT")
 
-    # --------------------------------------------------------
-    # Frozen selection lineage
-    # --------------------------------------------------------
-
+    # The evaluation must reference an existing SUCCESSFUL frozen selection.
     with BQML_LOCK:
-        stored = (
-            BQML_RUNS.get(run_id)
-            if isinstance(run_id, str)
-            else None
-        )
+        stored = BQML_RUNS.get(run_id) if isinstance(run_id, str) else None
 
     if (
         stored is None
         or stored["reasonCodes"] != []
+        or stored["selectedTrialId"] is None
+        or stored["datasetDigest"] is None
         or stored["selectedTrialId"] != selected_trial_id
         or stored["datasetDigest"] != dataset_digest
     ):
         codes.append("INVALID_LINEAGE")
 
-    # --------------------------------------------------------
-    # Validate final-test rows.
-    # Selection NEVER sees these rows.
-    # --------------------------------------------------------
-
-    valid_test_rows = []
-    every_row_valid = True
+    # Validate every final-test row. No selection row is used here.
+    valid_rows = []
+    all_rows_valid = True
 
     if isinstance(rows, list):
-
         for row in rows:
-
             if not bqml_test_row_valid(row):
-                every_row_valid = False
+                all_rows_valid = False
             else:
-                valid_test_rows.append(row)
+                valid_rows.append(row)
 
-        if not every_row_valid:
+        if not all_rows_valid:
             codes.append("INVALID_TEST_ROW")
 
-    # Empty rows or any invalid row:
-    # no aggregate/slice calculations.
-    skip_metric_checks = (
+    # Empty rows OR any invalid row means metric and slice checks
+    # are skipped. Lineage and byte checks still apply.
+    skip_metrics = (
         not isinstance(rows, list)
         or len(rows) == 0
-        or not every_row_valid
+        or not all_rows_valid
     )
 
     test_metric = None
 
-    # This gate is specifically about the required slices.
+    # criticalSlicePass concerns ONLY the slice gate, and is false
+    # for the explicitly listed failure conditions. Aggregate and
+    # byte failures do not automatically make it false.
     critical_slice_pass = not (
         "INVALID_INPUT" in codes
         or "INVALID_LINEAGE" in codes
         or "INVALID_TEST_ROW" in codes
-        or skip_metric_checks
+        or skip_metrics
     )
 
-    if not skip_metric_checks:
-
-        # ----------------------------------------------------
-        # Aggregate accuracy
-        # ----------------------------------------------------
+    if not skip_metrics:
 
         correct = sum(
             row["label"] == row["prediction"]
-            for row in valid_test_rows
+            for row in valid_rows
         )
 
         test_metric = round(
-            correct / len(valid_test_rows),
-            12
+            correct / len(valid_rows),
+            12,
         )
 
         if test_metric < float(metric_floor):
-            codes.append(
-                "AGGREGATE_FLOOR"
-            )
-
-        # ----------------------------------------------------
-        # Required slices
-        # ----------------------------------------------------
+            codes.append("AGGREGATE_FLOOR")
 
         slice_groups = {}
 
-        for row in valid_test_rows:
-            slice_groups.setdefault(
-                row["slice"],
-                []
-            ).append(row)
+        for row in valid_rows:
+            slice_groups.setdefault(row["slice"], []).append(row)
 
-        for slice_name, floor in required_slices.items():
+        # Required slices are evaluated independently.
+        for name, floor in required_slices.items():
 
-            if slice_name not in slice_groups:
-
-                codes.append(
-                    f"MISSING_SLICE:{slice_name}"
-                )
-
+            if name not in slice_groups:
+                codes.append(f"MISSING_SLICE:{name}")
                 critical_slice_pass = False
                 continue
 
-            slice_rows = slice_groups[
-                slice_name
-            ]
+            slice_rows = slice_groups[name]
 
             slice_correct = sum(
                 row["label"] == row["prediction"]
@@ -1784,21 +1634,14 @@ def bqml_evaluate(body):
 
             slice_accuracy = round(
                 slice_correct / len(slice_rows),
-                12
+                12,
             )
 
             if slice_accuracy < float(floor):
-
-                codes.append(
-                    f"SLICE_FLOOR:{slice_name}"
-                )
-
+                codes.append(f"SLICE_FLOOR:{name}")
                 critical_slice_pass = False
 
-    # --------------------------------------------------------
-    # Cost gate
-    # --------------------------------------------------------
-
+    # Byte check is independent of row/metric processing.
     if (
         bqml_safe_integer(bytes_processed)
         and bqml_safe_integer(max_bytes)
@@ -1808,23 +1651,15 @@ def bqml_evaluate(body):
 
     codes = sorted_codes(codes)
 
-    decision = (
-        "admit"
-        if not codes
-        else "reject"
-    )
-
     return {
         "runId": run_id,
         "selectedTrialId": selected_trial_id,
         "datasetDigest": dataset_digest,
         "testMetric": test_metric,
-        "criticalSlicePass": bool(
-            critical_slice_pass
-        ),
-        "decision": decision,
+        "criticalSlicePass": bool(critical_slice_pass),
+        "decision": "admit" if not codes else "reject",
         "bytesProcessed": bytes_processed,
-        "reasonCodes": codes
+        "reasonCodes": codes,
     }
 
 
@@ -1835,7 +1670,7 @@ def bqml():
         return app.response_class(
             response='{"error":"INVALID_INPUT"}',
             status=400,
-            mimetype="application/json"
+            mimetype="application/json",
         )
 
     try:
@@ -1844,59 +1679,48 @@ def bqml():
         return app.response_class(
             response='{"error":"INVALID_INPUT"}',
             status=400,
-            mimetype="application/json"
+            mimetype="application/json",
         )
 
     if not isinstance(body, dict):
         return app.response_class(
             response='{"error":"INVALID_INPUT"}',
             status=400,
-            mimetype="application/json"
+            mimetype="application/json",
         )
 
     phase = body.get("phase")
 
-    if phase not in (
-        "select",
-        "evaluate"
-    ):
+    if phase not in ("select", "evaluate"):
         return app.response_class(
             response='{"error":"INVALID_INPUT"}',
             status=400,
-            mimetype="application/json"
+            mimetype="application/json",
         )
-
-    # ========================================================
-    # SELECT
-    # ========================================================
 
     if phase == "select":
 
         run_id = body.get("runId")
         fingerprint = bqml_selection_fingerprint(body)
 
-        # Identical replay / runId conflict.
+        # Replay/conflict is checked before parsing the selection so
+        # the stored successful response can be returned byte-for-byte.
         if isinstance(run_id, str):
-
             with BQML_LOCK:
                 existing = BQML_RUNS.get(run_id)
 
             if existing is not None:
-
-                if (
-                    existing["fingerprint"]
-                    == fingerprint
-                ):
+                if existing["fingerprint"] == fingerprint:
                     return app.response_class(
                         response=existing["response_json"],
                         status=200,
-                        mimetype="application/json"
+                        mimetype="application/json",
                     )
 
                 return app.response_class(
                     response='{"error":"RUN_ID_CONFLICT"}',
                     status=409,
-                    mimetype="application/json"
+                    mimetype="application/json",
                 )
 
         response, fingerprint = bqml_select(body)
@@ -1905,70 +1729,54 @@ def bqml():
             return app.response_class(
                 response='{"error":"INVALID_INPUT"}',
                 status=400,
-                mimetype="application/json"
+                mimetype="application/json",
             )
 
         response_json = compact_json(response)
         response_run_id = response["runId"]
 
         if isinstance(response_run_id, str):
-
             with BQML_LOCK:
-
-                existing = BQML_RUNS.get(
-                    response_run_id
-                )
+                existing = BQML_RUNS.get(response_run_id)
 
                 if existing is not None:
-
-                    if (
-                        existing["fingerprint"]
-                        == fingerprint
-                    ):
+                    if existing["fingerprint"] == fingerprint:
                         return app.response_class(
                             response=existing["response_json"],
                             status=200,
-                            mimetype="application/json"
+                            mimetype="application/json",
                         )
 
                     return app.response_class(
                         response='{"error":"RUN_ID_CONFLICT"}',
                         status=409,
-                        mimetype="application/json"
+                        mimetype="application/json",
                     )
 
-                # Persist complete selection response.
+                # Persist the COMPLETE selection response, including
+                # a failed selection. Evaluation can only use the
+                # entries whose response has no reason codes.
                 BQML_RUNS[response_run_id] = {
                     "fingerprint": fingerprint,
                     "response": response,
                     "response_json": response_json,
-                    "selectedTrialId": response[
-                        "selectedTrialId"
-                    ],
-                    "datasetDigest": response[
-                        "datasetDigest"
-                    ],
-                    "reasonCodes": response[
-                        "reasonCodes"
-                    ]
+                    "selectedTrialId": response["selectedTrialId"],
+                    "datasetDigest": response["datasetDigest"],
+                    "reasonCodes": response["reasonCodes"],
                 }
 
         return app.response_class(
             response=response_json,
             status=200,
-            mimetype="application/json"
+            mimetype="application/json",
         )
-
-    # ========================================================
-    # EVALUATE
-    # ========================================================
 
     response = bqml_evaluate(body)
 
     return app.response_class(
         response=compact_json(response),
         status=200,
-        mimetype="application/json"
+        mimetype="application/json",
     )
 
 # ============================================================
