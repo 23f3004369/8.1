@@ -2264,6 +2264,1187 @@ def promote():
 
 
 # ============================================================
+# Q4 - Deterministic PEFT Adaptation Gate
+# Endpoint: POST /adapt
+# ============================================================
+
+ADAPT_INTERVENTIONS = (
+    "prompt_only",
+    "retrieval",
+    "lora",
+    "qlora",
+)
+
+ADAPT_CHOOSE_CODES = {
+    "INVALID_INPUT",
+    "UNAVAILABLE",
+    "QUALITY_FLOOR",
+    "FRESHNESS_REQUIRED",
+    "LATENCY_LIMIT",
+    "MEMORY_LIMIT",
+    "DATA_LIMIT",
+    "COST_LIMIT",
+}
+
+ADAPT_REPAIR_CODES = {
+    "INVALID_TOKEN",
+    "INVALID_PARAMETER",
+    "CHAT_TEMPLATE_COUNT",
+    "INFERENCE_MODE",
+    "FULL_MODEL_ARTIFACT",
+    "ADAPTER_FILE_SET",
+    "INCOMPLETE_CHECKPOINT",
+    "MUTABLE_BASE_REVISION",
+    "LINEAGE_MISMATCH",
+    "EFFECTIVE_BATCH_MISMATCH",
+    "EVAL_LEAKAGE",
+    "EVAL_DROPOUT_ACTIVE",
+    "RESUME_DIVERGENCE",
+}
+
+
+# ============================================================
+# Q4 helpers
+# ============================================================
+
+def adapt_safe_integer(value):
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= 9007199254740991
+    )
+
+
+def adapt_finite(value):
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
+
+
+def adapt_nonnegative_finite(value):
+    return (
+        adapt_finite(value)
+        and float(value) >= 0
+    )
+
+
+def adapt_unit_interval(value):
+    return (
+        adapt_finite(value)
+        and 0 <= float(value) <= 1
+    )
+
+
+def adapt_hex(value, length):
+    return (
+        isinstance(value, str)
+        and re.fullmatch(
+            rf"[0-9a-f]{{{length}}}",
+            value
+        ) is not None
+    )
+
+
+def adapt_unique_strings(value, nonempty=False):
+    if not isinstance(value, list):
+        return False
+
+    if nonempty and len(value) == 0:
+        return False
+
+    if any(not isinstance(x, str) for x in value):
+        return False
+
+    if len(set(value)) != len(value):
+        return False
+
+    return True
+
+
+def adapt_sorted_utf8(values):
+    return sorted(values, key=utf8)
+
+
+# ============================================================
+# CHOOSE
+# ============================================================
+
+def adapt_validate_candidate(candidate, policy):
+    """
+    Return:
+        (valid_structure, total_cost, reason_codes)
+
+    A candidate can have multiple applicable gate failures.
+    """
+
+    if not isinstance(candidate, dict):
+        return (
+            False,
+            None,
+            ["INVALID_INPUT"]
+        )
+
+    required = {
+        "name",
+        "available",
+        "quality",
+        "freshness",
+        "latencyMs",
+        "memoryMb",
+        "labeledExamples",
+        "oneTimeCost",
+        "recurringCost",
+    }
+
+    if set(candidate.keys()) != required:
+        return (
+            False,
+            None,
+            ["INVALID_INPUT"]
+        )
+
+    codes = []
+
+    # --------------------------------------------------------
+    # Basic candidate validation
+    # --------------------------------------------------------
+
+    if not isinstance(candidate["name"], str):
+        codes.append("INVALID_INPUT")
+
+    if not isinstance(candidate["available"], bool):
+        codes.append("INVALID_INPUT")
+
+    if not adapt_unit_interval(candidate["quality"]):
+        codes.append("INVALID_INPUT")
+
+    if not isinstance(candidate["freshness"], bool):
+        codes.append("INVALID_INPUT")
+
+    if not adapt_nonnegative_finite(
+        candidate["latencyMs"]
+    ):
+        codes.append("INVALID_INPUT")
+
+    if not adapt_nonnegative_finite(
+        candidate["memoryMb"]
+    ):
+        codes.append("INVALID_INPUT")
+
+    if not adapt_safe_integer(
+        candidate["labeledExamples"]
+    ):
+        codes.append("INVALID_INPUT")
+
+    if not adapt_nonnegative_finite(
+        candidate["oneTimeCost"]
+    ):
+        codes.append("INVALID_INPUT")
+
+    if not adapt_nonnegative_finite(
+        candidate["recurringCost"]
+    ):
+        codes.append("INVALID_INPUT")
+
+    # If the candidate itself is malformed, don't invent
+    # additional gate failures from unusable values.
+    if "INVALID_INPUT" in codes:
+        return (
+            False,
+            None,
+            sorted_codes(codes)
+        )
+
+    # --------------------------------------------------------
+    # Total cost
+    # --------------------------------------------------------
+
+    total_cost = round(
+        float(candidate["oneTimeCost"])
+        + float(policy["horizonRequests"])
+        * float(candidate["recurringCost"]),
+        12
+    )
+
+    # --------------------------------------------------------
+    # Eligibility gates
+    # --------------------------------------------------------
+
+    if not candidate["available"]:
+        codes.append("UNAVAILABLE")
+
+    if (
+        candidate["quality"]
+        < policy["minQuality"]
+    ):
+        codes.append("QUALITY_FLOOR")
+
+    if (
+        policy["freshnessRequired"]
+        and not candidate["freshness"]
+    ):
+        codes.append("FRESHNESS_REQUIRED")
+
+    if (
+        candidate["latencyMs"]
+        > policy["maxLatencyMs"]
+    ):
+        codes.append("LATENCY_LIMIT")
+
+    if (
+        candidate["memoryMb"]
+        > policy["maxMemoryMb"]
+    ):
+        codes.append("MEMORY_LIMIT")
+
+    if (
+        candidate["labeledExamples"]
+        > policy["maxLabeledExamples"]
+    ):
+        codes.append("DATA_LIMIT")
+
+    if (
+        total_cost
+        > policy["maxTotalCost"]
+    ):
+        codes.append("COST_LIMIT")
+
+    return (
+        True,
+        total_cost,
+        sorted_codes(codes)
+    )
+
+
+def adapt_choose(body):
+    required = {
+        "operation",
+        "policy",
+        "candidates",
+    }
+
+    if (
+        not isinstance(body, dict)
+        or set(body.keys()) != required
+        or body.get("operation") != "choose"
+    ):
+        return None
+
+    policy = body["policy"]
+
+    if not isinstance(policy, dict):
+        return None
+
+    policy_required = {
+        "minQuality",
+        "freshnessRequired",
+        "maxLatencyMs",
+        "maxMemoryMb",
+        "maxLabeledExamples",
+        "maxTotalCost",
+        "horizonRequests",
+    }
+
+    if set(policy.keys()) != policy_required:
+        return None
+
+    policy_invalid = False
+
+    if not adapt_unit_interval(
+        policy["minQuality"]
+    ):
+        policy_invalid = True
+
+    if not isinstance(
+        policy["freshnessRequired"],
+        bool
+    ):
+        policy_invalid = True
+
+    if not adapt_nonnegative_finite(
+        policy["maxLatencyMs"]
+    ):
+        policy_invalid = True
+
+    if not adapt_nonnegative_finite(
+        policy["maxMemoryMb"]
+    ):
+        policy_invalid = True
+
+    if not adapt_safe_integer(
+        policy["maxLabeledExamples"]
+    ):
+        policy_invalid = True
+
+    if not adapt_nonnegative_finite(
+        policy["maxTotalCost"]
+    ):
+        policy_invalid = True
+
+    if (
+        not adapt_safe_integer(
+            policy["horizonRequests"]
+        )
+    ):
+        policy_invalid = True
+
+    if policy_invalid:
+        return None
+
+    candidates = body["candidates"]
+
+    if not isinstance(candidates, list):
+        return None
+
+    # Exactly one candidate for each intervention.
+    if len(candidates) != 4:
+        return None
+
+    names = [
+        candidate.get("name")
+        if isinstance(candidate, dict)
+        else None
+        for candidate in candidates
+    ]
+
+    if (
+        any(
+            name not in ADAPT_INTERVENTIONS
+            for name in names
+        )
+        or len(set(names)) != 4
+    ):
+        return None
+
+    by_name = {
+        candidate["name"]: candidate
+        for candidate in candidates
+    }
+
+    eligible = []
+    total_costs = {}
+    reason_codes = {}
+
+    for name in ADAPT_INTERVENTIONS:
+
+        candidate = by_name[name]
+
+        valid, total_cost, codes = (
+            adapt_validate_candidate(
+                candidate,
+                policy
+            )
+        )
+
+        if total_cost is None:
+            total_costs[name] = None
+        else:
+            total_costs[name] = total_cost
+
+        reason_codes[name] = sorted_codes(codes)
+
+        if valid and not codes:
+            eligible.append(name)
+
+    selected = (
+        eligible[0]
+        if eligible
+        else None
+    )
+
+    return {
+        "selected": selected,
+        "eligible": eligible,
+        "totalCosts": total_costs,
+        "reasonCodes": reason_codes,
+    }
+
+
+# ============================================================
+# REPAIR - token/loss-mask validation
+# ============================================================
+
+def adapt_valid_token(token):
+    if not isinstance(token, dict):
+        return False
+
+    if set(token.keys()) != {
+        "id",
+        "role",
+        "padding",
+        "text"
+    }:
+        return False
+
+    if not adapt_safe_integer(token["id"]):
+        return False
+
+    if token["role"] not in (
+        "system",
+        "user",
+        "assistant"
+    ):
+        return False
+
+    if not isinstance(
+        token["padding"],
+        bool
+    ):
+        return False
+
+    if not isinstance(
+        token["text"],
+        str
+    ):
+        return False
+
+    return True
+
+
+def adapt_make_labels(tokens):
+    """
+    Valid token list:
+      unpadded assistant -> ID
+      everything else    -> -100
+
+    Any invalid token means ALL labels are -100.
+    """
+
+    if not isinstance(tokens, list):
+        return (
+            [-100] * (
+                len(tokens)
+                if isinstance(tokens, list)
+                else 0
+            ),
+            False
+        )
+
+    valid = all(
+        adapt_valid_token(token)
+        for token in tokens
+    )
+
+    if not valid:
+        return (
+            [-100] * len(tokens),
+            False
+        )
+
+    labels = []
+
+    for token in tokens:
+
+        if (
+            token["role"] == "assistant"
+            and not token["padding"]
+        ):
+            labels.append(token["id"])
+        else:
+            labels.append(-100)
+
+    return labels, True
+
+
+# ============================================================
+# REPAIR - parameter validation
+# ============================================================
+
+def adapt_parameter_valid(parameter):
+    if not isinstance(parameter, dict):
+        return False
+
+    if set(parameter.keys()) != {
+        "name",
+        "target",
+        "numel"
+    }:
+        return False
+
+    if not isinstance(
+        parameter["name"],
+        str
+    ):
+        return False
+
+    if not isinstance(
+        parameter["target"],
+        str
+    ):
+        return False
+
+    if (
+        not adapt_safe_integer(
+            parameter["numel"]
+        )
+        or parameter["numel"] <= 0
+    ):
+        return False
+
+    return True
+
+
+def adapt_is_lora_parameter(parameter, allowed_targets):
+    return (
+        parameter["target"] in allowed_targets
+        and (
+            parameter["name"].endswith(
+                ".lora_A.weight"
+            )
+            or parameter["name"].endswith(
+                ".lora_B.weight"
+            )
+        )
+    )
+
+
+def adapt_sum_numel(parameters):
+    total = 0
+
+    for parameter in parameters:
+        total += parameter["numel"]
+
+        if total > 9007199254740991:
+            return None
+
+    return total
+
+
+# ============================================================
+# REPAIR
+# ============================================================
+
+def adapt_repair(body):
+
+    codes = []
+
+    # --------------------------------------------------------
+    # Tokens
+    # --------------------------------------------------------
+
+    tokens = body.get("tokens")
+
+    labels, tokens_valid = adapt_make_labels(
+        tokens
+    )
+
+    if not tokens_valid:
+        codes.append("INVALID_TOKEN")
+
+    # --------------------------------------------------------
+    # Template application
+    # --------------------------------------------------------
+
+    if body.get("templateApplications") != 1:
+        codes.append(
+            "CHAT_TEMPLATE_COUNT"
+        )
+
+    # --------------------------------------------------------
+    # Parameters
+    # --------------------------------------------------------
+
+    parameters = body.get("parameters")
+    allowed_targets = body.get("allowedTargets")
+
+    parameters_valid = (
+        isinstance(parameters, list)
+        and isinstance(allowed_targets, list)
+    )
+
+    if not parameters_valid:
+        codes.append("INVALID_PARAMETER")
+        parameters = []
+        allowed_targets = []
+
+    else:
+
+        if (
+            len(set(
+                parameter.get("name")
+                for parameter in parameters
+                if isinstance(parameter, dict)
+            ))
+            != len(parameters)
+        ):
+            codes.append("INVALID_PARAMETER")
+
+        if not adapt_unique_strings(
+            allowed_targets,
+            nonempty=True
+        ):
+            codes.append("INVALID_PARAMETER")
+            allowed_targets = []
+
+        for parameter in parameters:
+            if not adapt_parameter_valid(
+                parameter
+            ):
+                codes.append(
+                    "INVALID_PARAMETER"
+                )
+
+    # --------------------------------------------------------
+    # Trainable LoRA parameters
+    # --------------------------------------------------------
+
+    trainable = []
+
+    for parameter in parameters:
+
+        if (
+            adapt_parameter_valid(parameter)
+            and adapt_is_lora_parameter(
+                parameter,
+                set(allowed_targets)
+            )
+        ):
+            trainable.append(
+                parameter
+            )
+
+    if not trainable:
+        codes.append("INVALID_PARAMETER")
+
+    trainable.sort(
+        key=lambda parameter: utf8(
+            parameter["name"]
+        )
+    )
+
+    trainable_names = [
+        parameter["name"]
+        for parameter in trainable
+    ]
+
+    trainable_count = adapt_sum_numel(
+        trainable
+    )
+
+    if trainable_count is None:
+        codes.append("INVALID_PARAMETER")
+        trainable_count = 0
+
+    # --------------------------------------------------------
+    # Inference / dropout
+    # --------------------------------------------------------
+
+    if body.get("inferenceMode") is not False:
+        codes.append("INFERENCE_MODE")
+
+    if body.get("dropoutActiveDuringEval") is not False:
+        codes.append(
+            "EVAL_DROPOUT_ACTIVE"
+        )
+
+    # --------------------------------------------------------
+    # Train/eval IDs
+    # --------------------------------------------------------
+
+    train_ids = body.get("trainRowIds")
+    eval_ids = body.get("evalRowIds")
+
+    train_valid = adapt_unique_strings(
+        train_ids,
+        nonempty=True
+    )
+
+    eval_valid = adapt_unique_strings(
+        eval_ids,
+        nonempty=True
+    )
+
+    if not train_valid or not eval_valid:
+        codes.append("EVAL_LEAKAGE")
+        train_ids = (
+            train_ids
+            if isinstance(train_ids, list)
+            else []
+        )
+        eval_ids = (
+            eval_ids
+            if isinstance(eval_ids, list)
+            else []
+        )
+    else:
+
+        if set(train_ids) & set(eval_ids):
+            codes.append("EVAL_LEAKAGE")
+
+    train_ids_sorted = adapt_sorted_utf8(
+        train_ids
+    )
+
+    eval_ids_sorted = adapt_sorted_utf8(
+        eval_ids
+    )
+
+    # --------------------------------------------------------
+    # Adapter files
+    # --------------------------------------------------------
+
+    artifact_files = body.get(
+        "artifactFiles"
+    )
+
+    expected_adapter_files = [
+        "adapter_config.json",
+        "adapter_model.safetensors",
+    ]
+
+    adapter_files_valid = (
+        isinstance(artifact_files, list)
+        and len(artifact_files) == 2
+        and all(
+            isinstance(x, str)
+            for x in artifact_files
+        )
+        and sorted(
+            artifact_files,
+            key=utf8
+        ) == sorted(
+            expected_adapter_files,
+            key=utf8
+        )
+    )
+
+    if not adapter_files_valid:
+        codes.append(
+            "ADAPTER_FILE_SET"
+        )
+
+    adapter_files = adapt_sorted_utf8(
+        artifact_files
+        if (
+            isinstance(artifact_files, list)
+            and all(
+                isinstance(x, str)
+                for x in artifact_files
+            )
+        )
+        else []
+    )
+
+    # A full-model artifact is any obvious full-model weight
+    # artifact rather than the required adapter-only artifact.
+    full_model_names = {
+        "pytorch_model.bin",
+        "pytorch_model.bin.index.json",
+        "model.safetensors",
+        "model.safetensors.index.json",
+    }
+
+    if (
+        isinstance(artifact_files, list)
+        and any(
+            isinstance(x, str)
+            and x in full_model_names
+            for x in artifact_files
+        )
+    ):
+        codes.append(
+            "FULL_MODEL_ARTIFACT"
+        )
+
+    # --------------------------------------------------------
+    # Base revision + lineage digests
+    # --------------------------------------------------------
+
+    base_revision = body.get(
+        "baseRevision"
+    )
+
+    dataset_digest = body.get(
+        "datasetDigest"
+    )
+
+    code_digest = body.get(
+        "codeDigest"
+    )
+
+    config_digest = body.get(
+        "configDigest"
+    )
+
+    if not adapt_hex(
+        base_revision,
+        40
+    ):
+        codes.append(
+            "MUTABLE_BASE_REVISION"
+        )
+
+    digest_values = (
+        dataset_digest,
+        code_digest,
+        config_digest
+    )
+
+    if not all(
+        isinstance(value, str)
+        and len(value) > 0
+        and adapt_hex(value, 64)
+        for value in digest_values
+    ):
+        codes.append(
+            "LINEAGE_MISMATCH"
+        )
+
+    # expectedDigests binds the supplied lineage evidence.
+    expected_digests = body.get(
+        "expectedDigests"
+    )
+
+    if not isinstance(
+        expected_digests,
+        dict
+    ):
+        codes.append(
+            "LINEAGE_MISMATCH"
+        )
+    else:
+
+        expected_dataset = expected_digests.get(
+            "datasetDigest"
+        )
+        expected_code = expected_digests.get(
+            "codeDigest"
+        )
+        expected_config = expected_digests.get(
+            "configDigest"
+        )
+
+        if (
+            expected_dataset is not None
+            and expected_dataset != dataset_digest
+        ):
+            codes.append(
+                "LINEAGE_MISMATCH"
+            )
+
+        if (
+            expected_code is not None
+            and expected_code != code_digest
+        ):
+            codes.append(
+                "LINEAGE_MISMATCH"
+            )
+
+        if (
+            expected_config is not None
+            and expected_config != config_digest
+        ):
+            codes.append(
+                "LINEAGE_MISMATCH"
+            )
+
+    # --------------------------------------------------------
+    # Effective batch
+    # --------------------------------------------------------
+
+    micro_batch = body.get(
+        "microBatch"
+    )
+
+    gradient_accumulation = body.get(
+        "gradientAccumulation"
+    )
+
+    replicas = body.get(
+        "replicas"
+    )
+
+    expected_batch = body.get(
+        "expectedEffectiveBatch"
+    )
+
+    batch_values = (
+        micro_batch,
+        gradient_accumulation,
+        replicas,
+        expected_batch
+    )
+
+    if not all(
+        adapt_safe_integer(x)
+        and x > 0
+        for x in batch_values
+    ):
+        codes.append(
+            "EFFECTIVE_BATCH_MISMATCH"
+        )
+    else:
+
+        product = (
+            micro_batch
+            * gradient_accumulation
+            * replicas
+        )
+
+        if product != expected_batch:
+            codes.append(
+                "EFFECTIVE_BATCH_MISMATCH"
+            )
+
+    # --------------------------------------------------------
+    # Checkpoint
+    # --------------------------------------------------------
+
+    checkpoint = body.get(
+        "checkpoint"
+    )
+
+    checkpoint_required = {
+        "model",
+        "optimizer",
+        "scheduler",
+        "step",
+        "rng",
+        "dataPosition"
+    }
+
+    if (
+        not isinstance(checkpoint, dict)
+        or not checkpoint_required.issubset(
+            checkpoint.keys()
+        )
+    ):
+        codes.append(
+            "INCOMPLETE_CHECKPOINT"
+        )
+
+    # --------------------------------------------------------
+    # Resume determinism
+    # --------------------------------------------------------
+
+    uninterrupted = body.get(
+        "uninterruptedWeights"
+    )
+
+    resumed = body.get(
+        "resumedWeights"
+    )
+
+    tolerance = body.get(
+        "resumeTolerance"
+    )
+
+    resume_arrays_valid = (
+        isinstance(uninterrupted, list)
+        and isinstance(resumed, list)
+        and len(uninterrupted) > 0
+        and len(uninterrupted) == len(resumed)
+        and all(
+            adapt_finite(x)
+            for x in uninterrupted
+        )
+        and all(
+            adapt_finite(x)
+            for x in resumed
+        )
+        and adapt_nonnegative_finite(
+            tolerance
+        )
+    )
+
+    if not resume_arrays_valid:
+
+        codes.append(
+            "RESUME_DIVERGENCE"
+        )
+
+    else:
+
+        for a, b in zip(
+            uninterrupted,
+            resumed
+        ):
+            if abs(
+                float(a) - float(b)
+            ) > float(tolerance):
+                codes.append(
+                    "RESUME_DIVERGENCE"
+                )
+                break
+
+    # --------------------------------------------------------
+    # Deterministic final response
+    # --------------------------------------------------------
+
+    codes = sorted_codes(codes)
+
+    return {
+        "labels": labels,
+        "templatePass": (
+            "CHAT_TEMPLATE_COUNT" not in codes
+        ),
+        "trainableParams": trainable_names,
+        "trainableCount": trainable_count,
+        "peftConfigPass": (
+            "INVALID_PARAMETER" not in codes
+        ),
+        "adapterFiles": adapter_files,
+        "checkpointComplete": (
+            "INCOMPLETE_CHECKPOINT" not in codes
+        ),
+        "lineagePass": not any(
+            code in codes
+            for code in (
+                "MUTABLE_BASE_REVISION",
+                "LINEAGE_MISMATCH"
+            )
+        ),
+        "evalIsolated": not any(
+            code in codes
+            for code in (
+                "EVAL_LEAKAGE",
+                "EVAL_DROPOUT_ACTIVE"
+            )
+        ),
+        "evaluationDeterministic": (
+            "EVAL_DROPOUT_ACTIVE" not in codes
+            and "RESUME_DIVERGENCE" not in codes
+        ),
+        "resumePass": (
+            "RESUME_DIVERGENCE" not in codes
+        ),
+        "reasonCodes": codes,
+    }
+
+
+# ============================================================
+# /adapt
+# ============================================================
+
+@app.route("/adapt", methods=["POST"])
+def adapt():
+
+    if not request.is_json:
+        return app.response_class(
+            response='{"error":"INVALID_INPUT"}',
+            status=400,
+            mimetype="application/json"
+        )
+
+    try:
+        body = request.get_json()
+    except Exception:
+        return app.response_class(
+            response='{"error":"INVALID_INPUT"}',
+            status=400,
+            mimetype="application/json"
+        )
+
+    if not isinstance(body, dict):
+        return app.response_class(
+            response='{"error":"INVALID_INPUT"}',
+            status=400,
+            mimetype="application/json"
+        )
+
+    operation = body.get("operation")
+
+    if operation not in (
+        "choose",
+        "repair"
+    ):
+        return app.response_class(
+            response='{"error":"INVALID_INPUT"}',
+            status=400,
+            mimetype="application/json"
+        )
+
+    # --------------------------------------------------------
+    # CHOOSE
+    # --------------------------------------------------------
+
+    if operation == "choose":
+
+        result = adapt_choose(body)
+
+        if result is None:
+            return app.response_class(
+                response='{"error":"INVALID_INPUT"}',
+                status=400,
+                mimetype="application/json"
+            )
+
+        return app.response_class(
+            response=compact_json(result),
+            status=200,
+            mimetype="application/json"
+        )
+
+    # --------------------------------------------------------
+    # REPAIR
+    # --------------------------------------------------------
+
+    required_repair = {
+        "operation",
+        "tokens",
+        "templateApplications",
+        "parameters",
+        "allowedTargets",
+        "inferenceMode",
+        "trainRowIds",
+        "evalRowIds",
+        "dropoutActiveDuringEval",
+        "artifactFiles",
+        "baseRevision",
+        "datasetDigest",
+        "codeDigest",
+        "configDigest",
+        "expectedDigests",
+        "microBatch",
+        "gradientAccumulation",
+        "replicas",
+        "expectedEffectiveBatch",
+        "checkpoint",
+        "uninterruptedWeights",
+        "resumedWeights",
+        "resumeTolerance",
+    }
+
+    # The operation itself is valid, but a missing repair
+    # field is a repair-level failure rather than the
+    # unknown-operation HTTP error.
+    if not required_repair.issubset(
+        body.keys()
+    ):
+        return app.response_class(
+            response=compact_json({
+                "labels": [],
+                "templatePass": False,
+                "trainableParams": [],
+                "trainableCount": 0,
+                "peftConfigPass": False,
+                "adapterFiles": [],
+                "checkpointComplete": False,
+                "lineagePass": False,
+                "evalIsolated": False,
+                "evaluationDeterministic": False,
+                "resumePass": False,
+                "reasonCodes": [
+                    "INVALID_PARAMETER"
+                ]
+            }),
+            status=200,
+            mimetype="application/json"
+        )
+
+    result = adapt_repair(body)
+
+    return app.response_class(
+        response=compact_json(result),
+        status=200,
+        mimetype="application/json"
+    )
+
+
+
+# ============================================================
 # Simple root endpoint
 # ============================================================
 
