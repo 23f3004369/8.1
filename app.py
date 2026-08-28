@@ -1091,7 +1091,7 @@ def bqml_selection_row_valid(row):
     if not isinstance(row, dict):
         return False
 
-    if set(row.keys()) != {
+    if not {
         "id",
         "entity",
         "eventTime",
@@ -1099,7 +1099,7 @@ def bqml_selection_row_valid(row):
         "version",
         "split",
         "features"
-    }:
+    }.issubset(row.keys()):
         return False
 
     # --------------------------------------------------------
@@ -1158,10 +1158,10 @@ def bqml_selection_row_valid(row):
         if not isinstance(feature, dict):
             return False
 
-        if set(feature.keys()) != {
+        if not {
             "value",
             "availableAt"
-        }:
+        }.issubset(feature.keys()):
             return False
 
         # Feature value is intentionally NOT type-restricted.
@@ -1297,7 +1297,7 @@ def bqml_eligible_features(rows, forbidden):
 def bqml_trial_shape_valid(trial):
     if not isinstance(trial, dict):
         return False
-    if set(trial.keys()) != {"trialId", "status", "evalMetric"}:
+    if not {"trialId", "status", "evalMetric"}.issubset(trial.keys()):
         return False
     if not bqml_safe_integer(trial["trialId"]):
         return False
@@ -1336,7 +1336,7 @@ def bqml_select(body):
 
     if (
         not isinstance(body, dict)
-        or set(body.keys()) != required
+        or not required.issubset(body.keys())
         or body.get("phase") != "select"
     ):
         return None, None
@@ -1544,11 +1544,11 @@ def bqml_test_row_valid(row):
     if not isinstance(row, dict):
         return False
 
-    if set(row.keys()) != {
+    if not {
         "label",
         "prediction",
         "slice"
-    }:
+    }.issubset(row.keys()):
         return False
 
     if (
@@ -1590,7 +1590,7 @@ def bqml_evaluate(body):
 
     if (
         not isinstance(body, dict)
-        or set(body.keys()) != required
+        or not required.issubset(body.keys())
         or body.get("phase") != "evaluate"
     ):
         return {
