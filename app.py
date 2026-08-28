@@ -4804,7 +4804,1076 @@ def pipeline():
             },
         )
 
+# ============================================================
+# Q7 - Publish a Verifiable Model Bundle and Model Card
+# Endpoint: POST /verify-bundle
+# ============================================================
 
+VERIFY_BUNDLE_REQUIRED_FILES = (
+    "README.md",
+    "training_manifest.json",
+    "evaluation.json",
+    "inventory.json",
+    "adapter_model.safetensors",
+    "adapter_config.json",
+)
+
+VERIFY_BUNDLE_UNSAFE_EXTENSIONS = (
+    ".bin",
+    ".pt",
+    ".pth",
+    ".pkl",
+    ".pickle",
+)
+
+VERIFY_BUNDLE_SAFE_MAX = 2**53 - 1
+
+
+def vb_utf8(value):
+    return value.encode("utf-8")
+
+
+def vb_json(value):
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def vb_sorted_codes(codes):
+    return sorted(
+        set(codes),
+        key=vb_utf8,
+    )
+
+
+def vb_safe_integer(value):
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= VERIFY_BUNDLE_SAFE_MAX
+    )
+
+
+def vb_positive_safe_integer(value):
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 1 <= value <= VERIFY_BUNDLE_SAFE_MAX
+    )
+
+
+def vb_finite(value):
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
+
+
+def vb_unit(value):
+    return (
+        vb_finite(value)
+        and 0 <= float(value) <= 1
+    )
+
+
+def vb_nonempty_string(value):
+    return (
+        isinstance(value, str)
+        and len(value) > 0
+    )
+
+
+def vb_sha256_text(value):
+    return hashlib.sha256(
+        value.encode("utf-8")
+    ).hexdigest()
+
+
+def vb_valid_sha256(value):
+    return (
+        isinstance(value, str)
+        and re.fullmatch(
+            r"[0-9a-f]{64}",
+            value,
+        ) is not None
+    )
+
+
+def vb_valid_base_revision(value):
+    return (
+        isinstance(value, str)
+        and re.fullmatch(
+            r"[0-9a-f]{40}",
+            value,
+        ) is not None
+    )
+
+
+# ------------------------------------------------------------
+# Parse JSON file
+# ------------------------------------------------------------
+
+def vb_parse_json(files, filename, violations):
+    content = files.get(filename)
+
+    if not isinstance(content, str):
+        violations.add(
+            "INVALID_FILE:" + filename
+        )
+        return None
+
+    try:
+        return json.loads(content)
+    except Exception:
+        violations.add(
+            "INVALID_JSON:" + filename
+        )
+        return None
+
+
+# ------------------------------------------------------------
+# Inventory
+# ------------------------------------------------------------
+
+def vb_recompute_inventory(files):
+    """
+    Recompute the exact inventory from all files except
+    inventory.json itself.
+    """
+
+    inventory = []
+
+    for name, content in files.items():
+
+        if name == "inventory.json":
+            continue
+
+        if not isinstance(name, str):
+            continue
+
+        if not isinstance(content, str):
+            continue
+
+        raw = content.encode("utf-8")
+
+        inventory.append({
+            "name": name,
+            "bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        })
+
+    inventory.sort(
+        key=lambda item: vb_utf8(item["name"])
+    )
+
+    return inventory
+
+
+def vb_inventory_digest(inventory):
+    return hashlib.sha256(
+        vb_json(inventory).encode("utf-8")
+    ).hexdigest()
+
+
+def vb_validate_inventory(
+    files,
+    inventory_value,
+    violations,
+):
+    """
+    Validate inventory.json against the actual files.
+    """
+
+    actual = vb_recompute_inventory(files)
+
+    if not isinstance(inventory_value, list):
+
+        violations.add(
+            "INVALID_JSON:inventory.json"
+        )
+
+        return actual, None
+
+    normalized = []
+
+    seen = set()
+
+    valid_structure = True
+
+    for entry in inventory_value:
+
+        if not isinstance(entry, dict):
+
+            valid_structure = False
+            break
+
+        if set(entry.keys()) != {
+            "name",
+            "bytes",
+            "sha256",
+        }:
+
+            valid_structure = False
+            break
+
+        name = entry["name"]
+        byte_count = entry["bytes"]
+        digest = entry["sha256"]
+
+        if (
+            not isinstance(name, str)
+            or name == ""
+            or name in seen
+        ):
+
+            valid_structure = False
+            break
+
+        if not vb_safe_integer(byte_count):
+
+            valid_structure = False
+            break
+
+        if not vb_valid_sha256(digest):
+
+            valid_structure = False
+            break
+
+        seen.add(name)
+
+        normalized.append({
+            "name": name,
+            "bytes": byte_count,
+            "sha256": digest,
+        })
+
+    if not valid_structure:
+
+        violations.add(
+            "INVENTORY_MISMATCH"
+        )
+
+        return actual, vb_inventory_digest(actual)
+
+    # Inventory must already be sorted by UTF-8 filename.
+    expected_sorted = sorted(
+        normalized,
+        key=lambda item: vb_utf8(item["name"])
+    )
+
+    if normalized != expected_sorted:
+
+        violations.add(
+            "INVENTORY_MISMATCH"
+        )
+
+    # Compare exact entries.
+    if normalized != actual:
+
+        violations.add(
+            "INVENTORY_MISMATCH"
+        )
+
+    actual_names = {
+        item["name"]
+        for item in actual
+    }
+
+    recorded_names = {
+        item["name"]
+        for item in normalized
+    }
+
+    # Files which exist but aren't tracked.
+    if actual_names - recorded_names:
+
+        violations.add(
+            "UNTRACKED_FILE"
+        )
+
+    digest = vb_inventory_digest(actual)
+
+    return actual, digest
+
+
+# ------------------------------------------------------------
+# Adapter config
+# ------------------------------------------------------------
+
+def vb_validate_adapter_config(
+    config,
+    violations,
+):
+
+    if not isinstance(config, dict):
+
+        violations.add(
+            "INVALID_ADAPTER_CONFIG"
+        )
+
+        return
+
+    r = config.get("r")
+
+    targets = config.get(
+        "target_modules"
+    )
+
+    if not vb_positive_safe_integer(r):
+
+        violations.add(
+            "INVALID_ADAPTER_CONFIG"
+        )
+
+    if not isinstance(targets, list):
+
+        violations.add(
+            "INVALID_ADAPTER_CONFIG"
+        )
+
+        return
+
+    if len(targets) == 0:
+
+        violations.add(
+            "INVALID_ADAPTER_CONFIG"
+        )
+
+        return
+
+    if any(
+        not isinstance(x, str)
+        or x == ""
+        for x in targets
+    ):
+
+        violations.add(
+            "INVALID_ADAPTER_CONFIG"
+        )
+
+    if len(set(targets)) != len(targets):
+
+        violations.add(
+            "INVALID_ADAPTER_CONFIG"
+        )
+
+
+# ------------------------------------------------------------
+# Training manifest
+# ------------------------------------------------------------
+
+def vb_validate_training_manifest(
+    manifest,
+    model_digest,
+    evaluation_digest,
+    violations,
+):
+
+    if not isinstance(manifest, dict):
+
+        violations.add(
+            "INVALID_TRAINING_MANIFEST"
+        )
+
+        return None
+
+    required = (
+        "baseRevision",
+        "task",
+        "datasetDigest",
+        "codeDigest",
+        "trainingConfigDigest",
+        "modelArtifactDigest",
+        "evaluationArtifactDigest",
+    )
+
+    for field in required:
+
+        if (
+            field not in manifest
+            or not vb_nonempty_string(
+                manifest[field]
+            )
+        ):
+
+            violations.add(
+                "MISSING_MANIFEST_FIELD:" + field
+            )
+
+    base_revision = manifest.get(
+        "baseRevision"
+    )
+
+    if (
+        base_revision is not None
+        and (
+            not isinstance(base_revision, str)
+            or re.fullmatch(
+                r"[0-9a-f]{40}",
+                base_revision,
+            ) is None
+        )
+    ):
+
+        violations.add(
+            "MUTABLE_BASE_REVISION"
+        )
+
+    # Verify model artifact digest.
+    if (
+        isinstance(
+            manifest.get(
+                "modelArtifactDigest"
+            ),
+            str,
+        )
+        and manifest.get(
+            "modelArtifactDigest"
+        ) != model_digest
+    ):
+
+        violations.add(
+            "MODEL_ARTIFACT_MISMATCH"
+        )
+
+    # Verify evaluation artifact digest.
+    if (
+        isinstance(
+            manifest.get(
+                "evaluationArtifactDigest"
+            ),
+            str,
+        )
+        and manifest.get(
+            "evaluationArtifactDigest"
+        ) != evaluation_digest
+    ):
+
+        violations.add(
+            "EVALUATION_ARTIFACT_MISMATCH"
+        )
+
+    return manifest
+
+
+# ------------------------------------------------------------
+# Evaluation
+# ------------------------------------------------------------
+
+def vb_validate_evaluation(
+    evaluation,
+    model_digest,
+    policy,
+    violations,
+):
+
+    if not isinstance(evaluation, dict):
+
+        violations.add(
+            "INVALID_EVALUATION"
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Model binding
+    # --------------------------------------------------------
+
+    evaluation_model_digest = evaluation.get(
+        "modelArtifactDigest"
+    )
+
+    if (
+        not isinstance(
+            evaluation_model_digest,
+            str,
+        )
+        or evaluation_model_digest
+        != model_digest
+    ):
+
+        violations.add(
+            "MODEL_ARTIFACT_MISMATCH"
+        )
+
+    # --------------------------------------------------------
+    # Aggregate
+    # --------------------------------------------------------
+
+    aggregate = evaluation.get(
+        "accuracy"
+    )
+
+    if not vb_finite(aggregate):
+
+        violations.add(
+            "INVALID_AGGREGATE"
+        )
+
+    elif not vb_unit(aggregate):
+
+        violations.add(
+            "INVALID_AGGREGATE"
+        )
+
+    # --------------------------------------------------------
+    # Required slices
+    # --------------------------------------------------------
+
+    slices = evaluation.get(
+        "slices"
+    )
+
+    if not isinstance(slices, dict):
+
+        for name in policy["requiredSlices"]:
+
+            violations.add(
+                "MISSING_SLICE:" + name
+            )
+
+        return
+
+    for name in policy["requiredSlices"]:
+
+        if name not in slices:
+
+            violations.add(
+                "MISSING_SLICE:" + name
+            )
+
+            continue
+
+        value = slices[name]
+
+        if not vb_finite(value):
+
+            violations.add(
+                "SLICE_RANGE:" + name
+            )
+
+        elif not vb_unit(value):
+
+            violations.add(
+                "SLICE_RANGE:" + name
+            )
+
+
+# ------------------------------------------------------------
+# Model-card marker
+# ------------------------------------------------------------
+
+def vb_find_model_card(readme):
+    """
+    Find the exact marker:
+
+    <!-- tds-model-card {...} -->
+
+    JSON braces inside strings are handled naturally by
+    locating the marker prefix and the closing -->.
+    """
+
+    prefix = "<!-- tds-model-card "
+
+    count = readme.count(prefix)
+
+    if count == 0:
+        return 0, None
+
+    if count > 1:
+        return count, None
+
+    start = readme.find(prefix)
+
+    payload_start = (
+        start + len(prefix)
+    )
+
+    end = readme.find(
+        "-->",
+        payload_start,
+    )
+
+    if end == -1:
+        return 1, None
+
+    payload = readme[
+        payload_start:end
+    ]
+
+    try:
+        parsed = json.loads(payload)
+    except Exception:
+        return 1, "__INVALID__"
+
+    if not isinstance(parsed, dict):
+        return 1, "__INVALID__"
+
+    return 1, parsed
+
+
+# ------------------------------------------------------------
+# Main verifier
+# ------------------------------------------------------------
+
+def verify_bundle_compute(body):
+
+    violations = set()
+
+    policy = body.get(
+        "policy"
+    )
+
+    files = body.get(
+        "files"
+    )
+
+    # --------------------------------------------------------
+    # Policy
+    # --------------------------------------------------------
+
+    policy_valid = True
+
+    if not isinstance(policy, dict):
+
+        return {
+            "decision": "reject",
+            "violations": [
+                "INVALID_POLICY"
+            ],
+            "inventoryDigest": None,
+        }
+
+    required_slices = policy.get(
+        "requiredSlices"
+    )
+
+    if (
+        not isinstance(
+            required_slices,
+            list,
+        )
+        or len(required_slices) == 0
+        or any(
+            not isinstance(x, str)
+            or x == ""
+            for x in required_slices
+        )
+        or len(set(required_slices))
+        != len(required_slices)
+    ):
+
+        violations.add(
+            "INVALID_POLICY"
+        )
+
+    for field in (
+        "license",
+        "intendedUse",
+        "limitations",
+    ):
+
+        if not vb_nonempty_string(
+            policy.get(field)
+        ):
+
+            violations.add(
+                "INVALID_POLICY"
+            )
+
+    if not isinstance(files, dict):
+
+        return {
+            "decision": "reject",
+            "violations": [
+                "INVALID_POLICY"
+            ],
+            "inventoryDigest": None,
+        }
+
+    # --------------------------------------------------------
+    # File names and UTF-8 content
+    # --------------------------------------------------------
+
+    for filename, content in files.items():
+
+        if (
+            not isinstance(filename, str)
+            or filename == ""
+            or not isinstance(content, str)
+        ):
+
+            violations.add(
+                "INVALID_FILE:" + str(filename)
+            )
+
+            continue
+
+        lower_name = filename.lower()
+
+        for extension in (
+            VERIFY_BUNDLE_UNSAFE_EXTENSIONS
+        ):
+
+            if lower_name.endswith(extension):
+
+                violations.add(
+                    "UNSAFE_WEIGHTS"
+                )
+
+                break
+
+    # --------------------------------------------------------
+    # Required files
+    # --------------------------------------------------------
+
+    for filename in (
+        VERIFY_BUNDLE_REQUIRED_FILES
+    ):
+
+        if filename not in files:
+
+            violations.add(
+                "MISSING_FILE:" + filename
+            )
+
+    # --------------------------------------------------------
+    # Inventory
+    # --------------------------------------------------------
+
+    inventory_digest = None
+
+    inventory_value = None
+
+    if "inventory.json" in files:
+
+        inventory_value = vb_parse_json(
+            files,
+            "inventory.json",
+            violations,
+        )
+
+        actual_inventory, inventory_digest = (
+            vb_validate_inventory(
+                files,
+                inventory_value,
+                violations,
+            )
+        )
+
+    # --------------------------------------------------------
+    # Adapter config
+    # --------------------------------------------------------
+
+    adapter_config = None
+
+    if "adapter_config.json" in files:
+
+        adapter_config = vb_parse_json(
+            files,
+            "adapter_config.json",
+            violations,
+        )
+
+        if adapter_config is not None:
+
+            vb_validate_adapter_config(
+                adapter_config,
+                violations,
+            )
+
+    # --------------------------------------------------------
+    # Artifact digests
+    # --------------------------------------------------------
+
+    model_digest = None
+
+    evaluation_digest = None
+
+    if isinstance(
+        files.get(
+            "adapter_model.safetensors"
+        ),
+        str,
+    ):
+
+        model_digest = vb_sha256_text(
+            files[
+                "adapter_model.safetensors"
+            ]
+        )
+
+    if isinstance(
+        files.get(
+            "evaluation.json"
+        ),
+        str,
+    ):
+
+        evaluation_digest = vb_sha256_text(
+            files["evaluation.json"]
+        )
+
+    # --------------------------------------------------------
+    # Training manifest
+    # --------------------------------------------------------
+
+    manifest = None
+
+    if "training_manifest.json" in files:
+
+        manifest = vb_parse_json(
+            files,
+            "training_manifest.json",
+            violations,
+        )
+
+        if manifest is not None:
+
+            vb_validate_training_manifest(
+                manifest,
+                model_digest,
+                evaluation_digest,
+                violations,
+            )
+
+    # --------------------------------------------------------
+    # Evaluation
+    # --------------------------------------------------------
+
+    evaluation = None
+
+    if "evaluation.json" in files:
+
+        evaluation = vb_parse_json(
+            files,
+            "evaluation.json",
+            violations,
+        )
+
+        if evaluation is not None:
+
+            vb_validate_evaluation(
+                evaluation,
+                model_digest,
+                {
+                    "requiredSlices":
+                        required_slices
+                    if isinstance(
+                        required_slices,
+                        list,
+                    )
+                    else [],
+                },
+                violations,
+            )
+
+    # --------------------------------------------------------
+    # Model card
+    # --------------------------------------------------------
+
+    if "README.md" in files:
+
+        readme = files["README.md"]
+
+        if isinstance(readme, str):
+
+            marker_count, card = (
+                vb_find_model_card(
+                    readme
+                )
+            )
+
+            if marker_count == 0:
+
+                violations.add(
+                    "MODEL_CARD_COUNT"
+                )
+
+                violations.add(
+                    "MISSING_MODEL_CARD"
+                )
+
+            elif marker_count > 1:
+
+                # Multiple markers emit ONLY
+                # MODEL_CARD_COUNT.
+                violations.add(
+                    "MODEL_CARD_COUNT"
+                )
+
+            elif card == "__INVALID__":
+
+                violations.add(
+                    "INVALID_MODEL_CARD"
+                )
+
+            elif isinstance(card, dict):
+
+                # Compare only when machine evidence
+                # exists.
+                expected = {
+                    "task":
+                        manifest.get("task")
+                        if isinstance(
+                            manifest,
+                            dict,
+                        )
+                        else None,
+
+                    "baseRevision":
+                        manifest.get(
+                            "baseRevision"
+                        )
+                        if isinstance(
+                            manifest,
+                            dict,
+                        )
+                        else None,
+
+                    "datasetDigest":
+                        manifest.get(
+                            "datasetDigest"
+                        )
+                        if isinstance(
+                            manifest,
+                            dict,
+                        )
+                        else None,
+
+                    "modelArtifactDigest":
+                        manifest.get(
+                            "modelArtifactDigest"
+                        )
+                        if isinstance(
+                            manifest,
+                            dict,
+                        )
+                        else None,
+
+                    "license":
+                        policy.get(
+                            "license"
+                        ),
+
+                    "intendedUse":
+                        policy.get(
+                            "intendedUse"
+                        ),
+
+                    "limitations":
+                        policy.get(
+                            "limitations"
+                        ),
+                }
+
+                for field, expected_value in (
+                    expected.items()
+                ):
+
+                    if (
+                        card.get(field)
+                        != expected_value
+                    ):
+
+                        violations.add(
+                            "MODEL_CARD_MISMATCH"
+                        )
+
+                        break
+
+    # --------------------------------------------------------
+    # Final response
+    # --------------------------------------------------------
+
+    final_codes = vb_sorted_codes(
+        violations
+    )
+
+    return {
+        "decision":
+            "admit"
+            if not final_codes
+            else "reject",
+
+        "violations":
+            final_codes,
+
+        "inventoryDigest":
+            inventory_digest,
+    }
+
+
+# ------------------------------------------------------------
+# POST /verify-bundle
+# ------------------------------------------------------------
+
+@app.route(
+    "/verify-bundle",
+    methods=["POST"],
+)
+def verify_bundle():
+
+    body = request.get_json(
+        silent=True
+    )
+
+    # --------------------------------------------------------
+    # Only these malformed top-level requests require
+    # HTTP 400 with exactly INVALID_INPUT.
+    # --------------------------------------------------------
+
+    if not isinstance(body, dict):
+
+        return (
+            json.dumps(
+                {"error": "INVALID_INPUT"},
+                separators=(",", ":"),
+            ),
+            400,
+            {
+                "Content-Type":
+                    "application/json"
+            },
+        )
+
+    if (
+        "policy" not in body
+        or "files" not in body
+        or not isinstance(
+            body.get("policy"),
+            dict,
+        )
+        or not isinstance(
+            body.get("files"),
+            dict,
+        )
+    ):
+
+        return (
+            json.dumps(
+                {"error": "INVALID_INPUT"},
+                separators=(",", ":"),
+            ),
+            400,
+            {
+                "Content-Type":
+                    "application/json"
+            },
+        )
+
+    result = verify_bundle_compute(
+        body
+    )
+
+    return app.response_class(
+        response=vb_json(result),
+        status=200,
+        mimetype="application/json",
+    )
 
 # ============================================================
 # Simple root endpoint
