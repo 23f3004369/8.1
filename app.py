@@ -3442,8 +3442,9 @@ def adapt():
         mimetype="application/json"
     )
 
+
 # ============================================================
-# Q5 - Quantize and Admit a Model Under Explicit Constraints
+# Q5 - Quantize and Admit a Model
 # Endpoint: POST /quantize
 # ============================================================
 
@@ -3451,84 +3452,69 @@ QUANTIZE_FREEZES = {}
 QUANTIZE_SAFE_MAX = 2**53 - 1
 
 
-def quantize_safe_integer(value):
+def q5_safe_integer(x):
     return (
-        isinstance(value, int)
-        and not isinstance(value, bool)
-        and 0 <= value <= QUANTIZE_SAFE_MAX
+        isinstance(x, int)
+        and not isinstance(x, bool)
+        and 0 <= x <= QUANTIZE_SAFE_MAX
     )
 
 
-def quantize_positive_safe_integer(value):
+def q5_finite(x):
     return (
-        isinstance(value, int)
-        and not isinstance(value, bool)
-        and 1 <= value <= QUANTIZE_SAFE_MAX
+        isinstance(x, (int, float))
+        and not isinstance(x, bool)
+        and math.isfinite(float(x))
     )
 
 
-def quantize_finite(value):
+def q5_nonnegative_finite(x):
+    return q5_finite(x) and float(x) >= 0
+
+
+def q5_unit(x):
+    return q5_finite(x) and 0 <= float(x) <= 1
+
+
+def q5_sha256(x):
     return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(float(value))
+        isinstance(x, str)
+        and re.fullmatch(r"[0-9a-f]{64}", x) is not None
     )
 
 
-def quantize_nonnegative_finite(value):
-    return (
-        quantize_finite(value)
-        and float(value) >= 0
-    )
+def q5_nonempty_string(x):
+    return isinstance(x, str) and len(x) > 0
 
 
-def quantize_unit(value):
-    return (
-        quantize_finite(value)
-        and 0 <= float(value) <= 1
-    )
-
-
-def quantize_digest(value):
-    return (
-        isinstance(value, str)
-        and value != ""
-    )
-
-
-def quantize_sha256(value):
-    return (
-        isinstance(value, str)
-        and re.fullmatch(r"[0-9a-f]{64}", value) is not None
-    )
-
-
-def quantize_unique_nonempty_strings(value):
-    if not isinstance(value, list):
-        return False
-
-    if len(value) == 0:
+def q5_unique_strings(x):
+    if not isinstance(x, list) or not x:
         return False
 
     if any(
-        not isinstance(x, str) or x == ""
-        for x in value
+        not isinstance(v, str) or v == ""
+        for v in x
     ):
         return False
 
-    return len(set(value)) == len(value)
+    return len(set(x)) == len(x)
 
 
-# ------------------------------------------------------------
-# Inventory calculation / validation
-# ------------------------------------------------------------
+def q5_sorted_codes(codes):
+    return sorted(
+        set(codes),
+        key=lambda x: x.encode("utf-8")
+    )
 
-def quantize_inventory(inventory):
+
+def q5_inventory(inventory):
     """
-    Recompute the inventory, total bytes and package digest.
+    Recompute inventory, totalBytes and packageDigest.
 
-    Inventory entries use the exact key order:
+    Inventory entries must have exactly:
         name, bytes, sha256
+
+    Inventory is sorted by UTF-8 filename.
     """
 
     if not isinstance(inventory, list):
@@ -3553,17 +3539,16 @@ def quantize_inventory(inventory):
         byte_count = item["bytes"]
         digest = item["sha256"]
 
-        if (
-            not isinstance(name, str)
-            or name == ""
-            or name in seen
-        ):
+        if not q5_nonempty_string(name):
             return None, None, None, False
 
-        if not quantize_safe_integer(byte_count):
+        if name in seen:
             return None, None, None, False
 
-        if not quantize_sha256(digest):
+        if not q5_safe_integer(byte_count):
+            return None, None, None, False
+
+        if not q5_sha256(digest):
             return None, None, None, False
 
         seen.add(name)
@@ -3575,7 +3560,7 @@ def quantize_inventory(inventory):
         })
 
     normalized.sort(
-        key=lambda x: utf8(x["name"])
+        key=lambda x: x["name"].encode("utf-8")
     )
 
     total = 0
@@ -3587,7 +3572,11 @@ def quantize_inventory(inventory):
             return None, None, None, False
 
     package_digest = hashlib.sha256(
-        compact_json(normalized).encode("utf-8")
+        json.dumps(
+            normalized,
+            ensure_ascii=False,
+            separators=(",", ":")
+        ).encode("utf-8")
     ).hexdigest()
 
     return (
@@ -3599,10 +3588,10 @@ def quantize_inventory(inventory):
 
 
 # ------------------------------------------------------------
-# Freeze candidate
+# FREEZE
 # ------------------------------------------------------------
 
-def quantize_freeze_candidate(
+def q5_freeze_candidate(
     candidate,
     calibration_digest,
     tokenizer_digest,
@@ -3610,16 +3599,7 @@ def quantize_freeze_candidate(
 ):
 
     if not isinstance(candidate, dict):
-        return {
-            "name": "",
-            "status": "invalid",
-            "inventory": [],
-            "totalBytes": None,
-            "packageDigest": None,
-            "reasonCodes": [
-                "INVALID_INPUT"
-            ]
-        }
+        return None
 
     required = {
         "name",
@@ -3633,80 +3613,63 @@ def quantize_freeze_candidate(
         "unsupportedReason"
     }
 
-    if (
-        not required.issubset(candidate.keys())
-        or not set(candidate.keys()).issubset(
-            required | optional
-        )
+    if not required.issubset(candidate.keys()):
+        return None
+
+    if not set(candidate.keys()).issubset(
+        required | optional
     ):
-        return {
-            "name": (
-                candidate.get("name", "")
-                if isinstance(candidate.get("name"), str)
-                else ""
-            ),
-            "status": "invalid",
-            "inventory": [],
-            "totalBytes": None,
-            "packageDigest": None,
-            "reasonCodes": [
-                "INVALID_INPUT"
-            ]
-        }
+        return None
 
     name = candidate["name"]
     files = candidate["files"]
     loadable = candidate["loadable"]
-    candidate_calibration = candidate["calibrationDigest"]
-    candidate_tokenizer = candidate["tokenizerDigest"]
-    unsupported_reason = candidate.get("unsupportedReason")
+    candidate_calibration = candidate[
+        "calibrationDigest"
+    ]
+    candidate_tokenizer = candidate[
+        "tokenizerDigest"
+    ]
 
-    codes = []
-
-    # Basic candidate validation
-    if not isinstance(name, str) or name == "":
-        codes.append("INVALID_INPUT")
+    if not q5_nonempty_string(name):
+        return None
 
     if not isinstance(files, dict):
-        codes.append("INVALID_INPUT")
-        files = {}
-    else:
-        for filename, content in files.items():
-            if (
-                not isinstance(filename, str)
-                or filename == ""
-                or not isinstance(content, str)
-            ):
-                codes.append("INVALID_INPUT")
+        return None
+
+    for filename, content in files.items():
+
+        if not q5_nonempty_string(filename):
+            return None
+
+        if not isinstance(content, str):
+            return None
 
     if not isinstance(loadable, bool):
-        codes.append("INVALID_INPUT")
+        return None
 
-    if not quantize_digest(candidate_calibration):
-        codes.append("INVALID_INPUT")
+    if not q5_nonempty_string(
+        candidate_calibration
+    ):
+        return None
 
-    if not quantize_digest(candidate_tokenizer):
-        codes.append("INVALID_INPUT")
+    if not q5_nonempty_string(
+        candidate_tokenizer
+    ):
+        return None
+
+    unsupported_reason = candidate.get(
+        "unsupportedReason"
+    )
 
     if unsupported_reason is not None:
-        if (
-            not isinstance(unsupported_reason, str)
-            or unsupported_reason == ""
+        if not q5_nonempty_string(
+            unsupported_reason
         ):
-            codes.append("INVALID_INPUT")
-
-    if codes:
-        return {
-            "name": name if isinstance(name, str) else "",
-            "status": "invalid",
-            "inventory": [],
-            "totalBytes": None,
-            "packageDigest": None,
-            "reasonCodes": sorted_codes(codes)
-        }
+            return None
 
     # --------------------------------------------------------
-    # Build exact inventory from UTF-8 file contents
+    # Build inventory from the actual supplied file contents.
     # --------------------------------------------------------
 
     inventory = []
@@ -3718,11 +3681,13 @@ def quantize_freeze_candidate(
         inventory.append({
             "name": filename,
             "bytes": len(raw),
-            "sha256": hashlib.sha256(raw).hexdigest()
+            "sha256": hashlib.sha256(
+                raw
+            ).hexdigest()
         })
 
     inventory.sort(
-        key=lambda x: utf8(x["name"])
+        key=lambda x: x["name"].encode("utf-8")
     )
 
     total_bytes = sum(
@@ -3731,95 +3696,104 @@ def quantize_freeze_candidate(
     )
 
     if total_bytes > QUANTIZE_SAFE_MAX:
-        return {
-            "name": name,
-            "status": "invalid",
-            "inventory": [],
-            "totalBytes": None,
-            "packageDigest": None,
-            "reasonCodes": [
-                "INVALID_INPUT"
-            ]
-        }
+        return None
 
     package_digest = hashlib.sha256(
-        compact_json(inventory).encode("utf-8")
+        json.dumps(
+            inventory,
+            ensure_ascii=False,
+            separators=(",", ":")
+        ).encode("utf-8")
     ).hexdigest()
 
+    reason_codes = []
+
     # --------------------------------------------------------
-    # Unsupported candidate
+    # Determine frozen status.
     # --------------------------------------------------------
 
     if unsupported_reason is not None:
 
         if unsupported_reason in allowed_reasons:
 
-            return {
-                "name": name,
-                "status": "unsupported",
-                "inventory": inventory,
-                "totalBytes": total_bytes,
-                "packageDigest": package_digest,
-                "reasonCodes": []
-            }
+            status = "unsupported"
+
+        else:
+
+            reason_codes.append(
+                "UNALLOWED_UNSUPPORTED_REASON"
+            )
+
+            if not loadable:
+                reason_codes.append(
+                    "NOT_LOADABLE"
+                )
+
+            if candidate_calibration != calibration_digest:
+                reason_codes.append(
+                    "CALIBRATION_MISMATCH"
+                )
+
+            if candidate_tokenizer != tokenizer_digest:
+                reason_codes.append(
+                    "TOKENIZER_MISMATCH"
+                )
+
+            status = (
+                "invalid"
+                if reason_codes
+                else "frozen"
+            )
+
+    else:
+
+        if not loadable:
+            reason_codes.append(
+                "NOT_LOADABLE"
+            )
+
+        if candidate_calibration != calibration_digest:
+            reason_codes.append(
+                "CALIBRATION_MISMATCH"
+            )
+
+        if candidate_tokenizer != tokenizer_digest:
+            reason_codes.append(
+                "TOKENIZER_MISMATCH"
+            )
+
+        status = (
+            "invalid"
+            if reason_codes
+            else "frozen"
+        )
+
+    if status == "invalid":
 
         return {
             "name": name,
             "status": "invalid",
-            "inventory": inventory,
-            "totalBytes": total_bytes,
-            "packageDigest": package_digest,
-            "reasonCodes": [
-                "UNALLOWED_UNSUPPORTED_REASON"
-            ]
+            "inventory": [],
+            "totalBytes": None,
+            "packageDigest": None,
+            "reasonCodes": q5_sorted_codes(
+                reason_codes
+            )
         }
-
-    # --------------------------------------------------------
-    # Normal frozen candidate
-    # --------------------------------------------------------
-
-    if not loadable:
-        codes.append("NOT_LOADABLE")
-
-    if candidate_calibration != calibration_digest:
-        codes.append("CALIBRATION_MISMATCH")
-
-    if candidate_tokenizer != tokenizer_digest:
-        codes.append("TOKENIZER_MISMATCH")
-
-    status = (
-        "invalid"
-        if codes
-        else "frozen"
-    )
 
     return {
         "name": name,
         "status": status,
-        "inventory": (
-            inventory
-            if status != "invalid"
-            else []
-        ),
-        "totalBytes": (
-            total_bytes
-            if status != "invalid"
-            else None
-        ),
-        "packageDigest": (
-            package_digest
-            if status != "invalid"
-            else None
-        ),
-        "reasonCodes": sorted_codes(codes)
+        "inventory": inventory,
+        "totalBytes": total_bytes,
+        "packageDigest": package_digest,
+        "reasonCodes": q5_sorted_codes(
+            reason_codes
+        )
     }
 
 
-# ------------------------------------------------------------
-# Freeze request
-# ------------------------------------------------------------
-
-def quantize_freeze(body):
+def q5_freeze(body):
 
     required = {
         "phase",
@@ -3830,11 +3804,13 @@ def quantize_freeze(body):
         "candidates"
     }
 
-    if (
-        not isinstance(body, dict)
-        or not required.issubset(body.keys())
-        or body.get("phase") != "freeze"
-    ):
+    if not isinstance(body, dict):
+        return None
+
+    if not required.issubset(body.keys()):
+        return None
+
+    if body.get("phase") != "freeze":
         return None
 
     freeze_id = body["freezeId"]
@@ -3842,22 +3818,45 @@ def quantize_freeze(body):
     if (
         not isinstance(freeze_id, str)
         or freeze_id == ""
-        or len(freeze_id) > 128
     ):
         return None
 
-    calibration_digest = body["calibrationDigest"]
-    tokenizer_digest = body["tokenizerDigest"]
+    calibration_digest = body[
+        "calibrationDigest"
+    ]
 
-    if not quantize_digest(calibration_digest):
+    tokenizer_digest = body[
+        "tokenizerDigest"
+    ]
+
+    if not q5_nonempty_string(
+        calibration_digest
+    ):
         return None
 
-    if not quantize_digest(tokenizer_digest):
+    if not q5_nonempty_string(
+        tokenizer_digest
+    ):
         return None
 
-    allowed_reasons = body["allowedUnsupportedReasons"]
+    allowed_reasons = body[
+        "allowedUnsupportedReasons"
+    ]
 
-    if not quantize_unique_nonempty_strings(
+    if not isinstance(
+        allowed_reasons,
+        list
+    ):
+        return None
+
+    if any(
+        not isinstance(x, str)
+        or x == ""
+        for x in allowed_reasons
+    ):
+        return None
+
+    if len(set(allowed_reasons)) != len(
         allowed_reasons
     ):
         return None
@@ -3879,10 +3878,7 @@ def quantize_freeze(body):
 
         name = candidate.get("name")
 
-        if (
-            not isinstance(name, str)
-            or name == ""
-        ):
+        if not q5_nonempty_string(name):
             return None
 
         names.append(name)
@@ -3890,34 +3886,37 @@ def quantize_freeze(body):
     if len(set(names)) != len(names):
         return None
 
-    results = []
+    frozen_candidates = []
 
     for candidate in candidates:
 
-        results.append(
-            quantize_freeze_candidate(
-                candidate,
-                calibration_digest,
-                tokenizer_digest,
-                set(allowed_reasons)
-            )
+        frozen = q5_freeze_candidate(
+            candidate,
+            calibration_digest,
+            tokenizer_digest,
+            set(allowed_reasons)
         )
 
-    results.sort(
-        key=lambda x: utf8(x["name"])
+        if frozen is None:
+            return None
+
+        frozen_candidates.append(frozen)
+
+    frozen_candidates.sort(
+        key=lambda x: x["name"].encode("utf-8")
     )
 
     return {
         "freezeId": freeze_id,
-        "candidates": results
+        "candidates": frozen_candidates
     }
 
 
 # ------------------------------------------------------------
-# Validate stored/submitted frozen candidate
+# SELECT HELPERS
 # ------------------------------------------------------------
 
-def quantize_validate_frozen_candidate(candidate):
+def q5_validate_frozen_candidate(candidate):
 
     if not isinstance(candidate, dict):
         return False
@@ -3932,9 +3931,8 @@ def quantize_validate_frozen_candidate(candidate):
     }:
         return False
 
-    if (
-        not isinstance(candidate["name"], str)
-        or candidate["name"] == ""
+    if not q5_nonempty_string(
+        candidate["name"]
     ):
         return False
 
@@ -3957,11 +3955,9 @@ def quantize_validate_frozen_candidate(candidate):
     ):
         return False
 
-    inventory_result = quantize_inventory(
+    inventory, total, digest, valid = q5_inventory(
         candidate["inventory"]
     )
-
-    inventory, total, digest, valid = inventory_result
 
     if not valid:
         return False
@@ -3969,8 +3965,7 @@ def quantize_validate_frozen_candidate(candidate):
     if candidate["status"] == "invalid":
 
         if (
-            candidate["inventory"] != []
-            or candidate["totalBytes"] is not None
+            candidate["totalBytes"] is not None
             or candidate["packageDigest"] is not None
         ):
             return False
@@ -3986,16 +3981,12 @@ def quantize_validate_frozen_candidate(candidate):
     return True
 
 
-# ------------------------------------------------------------
-# Prediction validation / accuracy
-# ------------------------------------------------------------
-
-def quantize_accuracy(rows, candidate_name):
+def q5_accuracy(rows, candidate_name):
 
     if not isinstance(rows, list):
         return None, {}, False
 
-    if len(rows) == 0:
+    if not rows:
         return None, {}, False
 
     correct = 0
@@ -4024,19 +4015,23 @@ def quantize_accuracy(rows, candidate_name):
         ):
             return None, {}, False
 
-        if (
-            not isinstance(slice_name, str)
-            or slice_name == ""
+        if not q5_nonempty_string(
+            slice_name
         ):
             return None, {}, False
 
-        if not isinstance(predictions, dict):
+        if not isinstance(
+            predictions,
+            dict
+        ):
             return None, {}, False
 
         if candidate_name not in predictions:
             return None, {}, False
 
-        prediction = predictions[candidate_name]
+        prediction = predictions[
+            candidate_name
+        ]
 
         if (
             isinstance(prediction, bool)
@@ -4045,17 +4040,18 @@ def quantize_accuracy(rows, candidate_name):
         ):
             return None, {}, False
 
-        is_correct = prediction == label
-
-        if is_correct:
+        if prediction == label:
             correct += 1
 
         if slice_name not in slice_counts:
-            slice_counts[slice_name] = [0, 0]
+            slice_counts[slice_name] = [
+                0,
+                0
+            ]
 
         slice_counts[slice_name][1] += 1
 
-        if is_correct:
+        if prediction == label:
             slice_counts[slice_name][0] += 1
 
     aggregate = round(
@@ -4075,11 +4071,7 @@ def quantize_accuracy(rows, candidate_name):
     return aggregate, slices, True
 
 
-# ------------------------------------------------------------
-# Select candidate
-# ------------------------------------------------------------
-
-def quantize_select(body):
+def q5_select(body):
 
     required = {
         "phase",
@@ -4090,51 +4082,64 @@ def quantize_select(body):
         "rows"
     }
 
-    if (
-        not isinstance(body, dict)
-        or not required.issubset(body.keys())
-        or body.get("phase") != "select"
-    ):
+    if not isinstance(body, dict):
+        return None
+
+    if not required.issubset(body.keys()):
+        return None
+
+    if body.get("phase") != "select":
         return None
 
     freeze_id = body["freezeId"]
 
-    if (
-        not isinstance(freeze_id, str)
-        or freeze_id == ""
-    ):
+    if not q5_nonempty_string(freeze_id):
         return None
 
     candidates = body["candidates"]
-    policy = body["policy"]
-    latencies = body["latencies"]
-    rows = body["rows"]
 
     if not isinstance(candidates, list):
         return None
 
-    if not isinstance(policy, dict):
+    if len(candidates) == 0:
         return None
 
-    if not isinstance(latencies, dict):
-        return None
+    rows = body["rows"]
 
     if not isinstance(rows, list):
         return None
 
+    if len(rows) == 0:
+        return None
+
+    policy = body["policy"]
+
+    if not isinstance(policy, dict):
+        return None
+
+    latencies = body["latencies"]
+
+    if not isinstance(latencies, dict):
+        return None
+
+    # --------------------------------------------------------
+    # Retrieve frozen state.
+    # --------------------------------------------------------
+
+    frozen_record = QUANTIZE_FREEZES.get(
+        freeze_id
+    )
+
     global_codes = []
 
-    # --------------------------------------------------------
-    # Find freeze
-    # --------------------------------------------------------
+    if frozen_record is None:
 
-    frozen = QUANTIZE_FREEZES.get(freeze_id)
-
-    if frozen is None:
-        global_codes.append("NOT_FROZEN")
+        global_codes.append(
+            "NOT_FROZEN"
+        )
 
     # --------------------------------------------------------
-    # Validate policy
+    # Validate policy.
     # --------------------------------------------------------
 
     policy_required = {
@@ -4146,82 +4151,85 @@ def quantize_select(body):
     }
 
     policy_valid = (
-        set(policy.keys()) == policy_required
+        set(policy.keys())
+        == policy_required
     )
 
     if not policy_valid:
 
-        global_codes.append("INVALID_POLICY")
+        global_codes.append(
+            "INVALID_POLICY"
+        )
 
-    else:
+    if policy_valid:
 
-        if not quantize_safe_integer(
+        if not q5_safe_integer(
             policy["maxBytes"]
         ):
-            global_codes.append("INVALID_POLICY")
+            global_codes.append(
+                "INVALID_POLICY"
+            )
 
-        if not quantize_unit(
+        if not q5_unit(
             policy["aggregateFloor"]
         ):
-            global_codes.append("INVALID_POLICY")
+            global_codes.append(
+                "INVALID_POLICY"
+            )
 
-        required_slices = policy["requiredSlices"]
+        required_slices = policy[
+            "requiredSlices"
+        ]
 
         if not isinstance(
             required_slices,
             dict
         ):
-            global_codes.append("INVALID_POLICY")
+            global_codes.append(
+                "INVALID_POLICY"
+            )
 
         else:
 
-            seen_slice_names = set()
-
-            for name, floor in required_slices.items():
+            for slice_name, floor in (
+                required_slices.items()
+            ):
 
                 if (
-                    not isinstance(name, str)
-                    or name == ""
-                    or name in seen_slice_names
-                    or not quantize_unit(floor)
+                    not q5_nonempty_string(
+                        slice_name
+                    )
+                    or not q5_unit(floor)
                 ):
-                    global_codes.append("INVALID_POLICY")
+                    global_codes.append(
+                        "INVALID_POLICY"
+                    )
 
-                seen_slice_names.add(name)
-
-        if not quantize_nonnegative_finite(
+        if not q5_nonnegative_finite(
             policy["maxLatencyMs"]
         ):
-            global_codes.append("INVALID_POLICY")
+            global_codes.append(
+                "INVALID_POLICY"
+            )
 
-        if not quantize_unique_nonempty_strings(
+        if not q5_unique_strings(
             policy["candidateOrder"]
         ):
-            global_codes.append("INVALID_POLICY")
+            global_codes.append(
+                "INVALID_POLICY"
+            )
 
     # --------------------------------------------------------
-    # Frozen candidate array must exactly match stored response
+    # Candidate lineage.
     # --------------------------------------------------------
 
-    supplied_valid = True
-
-    if frozen is not None:
+    if frozen_record is not None:
 
         # IMPORTANT:
-        # QUANTIZE_FREEZES stores:
-        #
-        # {
-        #     "fingerprint": ...,
-        #     "response": {
-        #         "freezeId": ...,
-        #         "candidates": [...]
-        #     },
-        #     "response_json": ...
-        # }
-        #
-        # Therefore candidates are under frozen["response"].
-
-        stored_candidates = frozen["response"]["candidates"]
+        # The freeze state stores the complete response.
+        stored_candidates = frozen_record[
+            "response"
+        ]["candidates"]
 
         if candidates != stored_candidates:
 
@@ -4229,197 +4237,180 @@ def quantize_select(body):
                 "INVALID_LINEAGE"
             )
 
-            supplied_valid = False
-
-        else:
-
-            for candidate in candidates:
-
-                if not quantize_validate_frozen_candidate(
-                    candidate
-                ):
-                    global_codes.append(
-                        "INVALID_MANIFEST"
-                    )
-
-                    supplied_valid = False
-
     # --------------------------------------------------------
-    # Candidate names must equal candidateOrder
+    # Candidate names must equal candidateOrder.
     # --------------------------------------------------------
 
     if policy_valid:
 
-        order = policy["candidateOrder"]
+        order = policy[
+            "candidateOrder"
+        ]
 
         supplied_names = []
 
         for candidate in candidates:
 
             if isinstance(candidate, dict):
-                name = candidate.get("name")
 
-                if isinstance(name, str):
-                    supplied_names.append(name)
+                supplied_names.append(
+                    candidate.get("name")
+                )
 
         if (
-            len(supplied_names) != len(set(supplied_names))
-            or set(supplied_names) != set(order)
+            len(supplied_names)
+            != len(set(supplied_names))
+            or set(supplied_names)
+            != set(order)
         ):
+
             global_codes.append(
                 "INVALID_POLICY"
             )
 
-    else:
-
-        order = []
-
     # --------------------------------------------------------
-    # Validate latency map
+    # Validate latency values.
     # --------------------------------------------------------
 
-    for name, value in latencies.items():
+    for name, latency in latencies.items():
 
         if not isinstance(name, str):
-            global_codes.append("INVALID_POLICY")
+
+            global_codes.append(
+                "INVALID_POLICY"
+            )
+
             continue
 
-        if not quantize_nonnegative_finite(value):
-            global_codes.append("INVALID_POLICY")
+        if not q5_nonnegative_finite(
+            latency
+        ):
+
+            global_codes.append(
+                "INVALID_POLICY"
+            )
 
     # --------------------------------------------------------
-    # Result ordering
+    # Evaluate each candidate.
     # --------------------------------------------------------
-
-    order_index = {
-        name: index
-        for index, name in enumerate(order)
-    }
 
     results_by_name = {}
 
-    # --------------------------------------------------------
-    # Evaluate candidates
-    # --------------------------------------------------------
+    if frozen_record is not None:
 
-    for candidate in candidates:
+        for candidate in candidates:
 
-        if not isinstance(candidate, dict):
-            continue
+            if not isinstance(candidate, dict):
+                continue
 
-        name = candidate.get("name")
+            name = candidate.get("name")
 
-        if not isinstance(name, str):
-            continue
+            if not isinstance(name, str):
+                continue
 
-        codes = []
+            codes = []
 
-        aggregate = None
-        slices = {}
+            total_bytes = None
+            latency = None
 
-        total_bytes = None
-        latency = None
+            # ------------------------------------------------
+            # Manifest validation
+            # ------------------------------------------------
 
-        # ----------------------------------------------------
-        # Manifest
-        # ----------------------------------------------------
-
-        manifest_valid = (
-            quantize_validate_frozen_candidate(
-                candidate
-            )
-        )
-
-        if not manifest_valid:
-
-            codes.append("INVALID_MANIFEST")
-
-        else:
-
-            inventory_result = quantize_inventory(
-                candidate["inventory"]
+            manifest_valid = (
+                q5_validate_frozen_candidate(
+                    candidate
+                )
             )
 
-            inventory, recomputed_bytes, recomputed_digest, valid = (
-                inventory_result
-            )
+            if not manifest_valid:
 
-            if not valid:
-
-                codes.append("INVALID_MANIFEST")
+                codes.append(
+                    "INVALID_MANIFEST"
+                )
 
             else:
 
-                # Never trust submitted totalBytes.
-                total_bytes = recomputed_bytes
+                inventory_result = q5_inventory(
+                    candidate["inventory"]
+                )
 
-                if (
-                    candidate["totalBytes"]
-                    != recomputed_bytes
-                    or candidate["packageDigest"]
-                    != recomputed_digest
-                ):
+                (
+                    _inventory,
+                    recomputed_bytes,
+                    recomputed_digest,
+                    valid
+                ) = inventory_result
+
+                if not valid:
+
                     codes.append(
                         "INVALID_MANIFEST"
                     )
 
-        # ----------------------------------------------------
-        # Only frozen candidates may be admitted
-        # ----------------------------------------------------
+                else:
 
-        if candidate.get("status") != "frozen":
+                    total_bytes = (
+                        recomputed_bytes
+                    )
 
-            codes.append(
-                "INVALID_LINEAGE"
-            )
+                    if (
+                        candidate["totalBytes"]
+                        != recomputed_bytes
+                        or
+                        candidate["packageDigest"]
+                        != recomputed_digest
+                    ):
 
-        # ----------------------------------------------------
-        # Latency
-        # ----------------------------------------------------
+                        codes.append(
+                            "INVALID_MANIFEST"
+                        )
 
-        if name not in latencies:
+            # ------------------------------------------------
+            # Status / lineage
+            # ------------------------------------------------
 
-            codes.append(
-                "INVALID_POLICY"
-            )
+            if candidate.get("status") != "frozen":
 
-        else:
+                codes.append(
+                    "INVALID_LINEAGE"
+                )
 
-            latency_value = latencies[name]
+            # ------------------------------------------------
+            # Latency
+            # ------------------------------------------------
 
-            if quantize_nonnegative_finite(
-                latency_value
-            ):
-                latency = latency_value
+            if name not in latencies:
 
-            else:
                 codes.append(
                     "INVALID_POLICY"
                 )
 
-        # ----------------------------------------------------
-        # Predictions
-        # ----------------------------------------------------
+            else:
 
-        if len(rows) == 0:
+                latency_value = latencies[name]
 
-            codes.append(
-                "INVALID_PREDICTIONS"
-            )
+                if q5_nonnegative_finite(
+                    latency_value
+                ):
 
-            # Required slices have no validated values.
-            if policy_valid:
+                    latency = latency_value
 
-                slices = {
-                    slice_name: None
-                    for slice_name in
-                    policy["requiredSlices"].keys()
-                }
+                else:
 
-        else:
+                    codes.append(
+                        "INVALID_POLICY"
+                    )
 
-            aggregate, calculated_slices, prediction_valid = (
-                quantize_accuracy(
+            # ------------------------------------------------
+            # Predictions
+            # ------------------------------------------------
+
+            aggregate = None
+            slices = {}
+
+            aggregate, slices, prediction_valid = (
+                q5_accuracy(
                     rows,
                     name
                 )
@@ -4428,123 +4419,137 @@ def quantize_select(body):
             if not prediction_valid:
 
                 aggregate = None
-
-                if policy_valid:
-
-                    slices = {
-                        slice_name: None
-                        for slice_name in
-                        policy["requiredSlices"].keys()
-                    }
-
-                else:
-
-                    slices = {}
+                slices = {}
 
                 codes.append(
                     "INVALID_PREDICTIONS"
                 )
 
-            else:
+            # ------------------------------------------------
+            # Aggregate floor
+            # ------------------------------------------------
 
-                slices = calculated_slices
-
-        # ----------------------------------------------------
-        # Aggregate floor
-        # ----------------------------------------------------
-
-        if (
-            aggregate is not None
-            and policy_valid
-            and aggregate < policy["aggregateFloor"]
-        ):
-
-            codes.append(
-                "AGGREGATE_FLOOR"
-            )
-
-        # ----------------------------------------------------
-        # Required slices
-        # ----------------------------------------------------
-
-        if (
-            policy_valid
-            and aggregate is not None
-        ):
-
-            for slice_name, floor in (
-                policy["requiredSlices"].items()
+            if (
+                aggregate is not None
+                and policy_valid
+                and aggregate
+                < policy["aggregateFloor"]
             ):
 
-                if slice_name not in slices:
+                codes.append(
+                    "AGGREGATE_FLOOR"
+                )
 
-                    codes.append(
-                        f"MISSING_SLICE:{slice_name}"
-                    )
+            # ------------------------------------------------
+            # Required slice floors
+            # ------------------------------------------------
 
-                elif slices[slice_name] < floor:
+            if (
+                policy_valid
+                and aggregate is not None
+            ):
 
-                    codes.append(
-                        f"SLICE_FLOOR:{slice_name}"
-                    )
+                for (
+                    slice_name,
+                    floor
+                ) in policy[
+                    "requiredSlices"
+                ].items():
 
-        # ----------------------------------------------------
-        # Size limit
-        # ----------------------------------------------------
+                    if slice_name not in slices:
 
-        if (
-            total_bytes is not None
-            and policy_valid
-            and total_bytes > policy["maxBytes"]
-        ):
+                        codes.append(
+                            f"MISSING_SLICE:{slice_name}"
+                        )
 
-            codes.append(
-                "SIZE_LIMIT"
+                    elif slices[
+                        slice_name
+                    ] < floor:
+
+                        codes.append(
+                            f"SLICE_FLOOR:{slice_name}"
+                        )
+
+            # ------------------------------------------------
+            # Size limit
+            # ------------------------------------------------
+
+            if (
+                total_bytes is not None
+                and policy_valid
+                and total_bytes
+                > policy["maxBytes"]
+            ):
+
+                codes.append(
+                    "SIZE_LIMIT"
+                )
+
+            # ------------------------------------------------
+            # Latency limit
+            # ------------------------------------------------
+
+            if (
+                latency is not None
+                and policy_valid
+                and latency
+                > policy["maxLatencyMs"]
+            ):
+
+                codes.append(
+                    "LATENCY_LIMIT"
+                )
+
+            codes = q5_sorted_codes(
+                codes
             )
 
-        # ----------------------------------------------------
-        # Latency limit
-        # ----------------------------------------------------
-
-        if (
-            latency is not None
-            and policy_valid
-            and latency > policy["maxLatencyMs"]
-        ):
-
-            codes.append(
-                "LATENCY_LIMIT"
-            )
-
-        codes = sorted_codes(codes)
-
-        results_by_name[name] = {
-            "name": name,
-            "aggregate": aggregate,
-            "slices": slices,
-            "totalBytes": total_bytes,
-            "latencyMs": latency,
-            "admitted": len(codes) == 0,
-            "reasonCodes": codes
-        }
+            results_by_name[name] = {
+                "name": name,
+                "aggregate": aggregate,
+                "slices": slices,
+                "totalBytes": total_bytes,
+                "latencyMs": latency,
+                "admitted": len(codes) == 0,
+                "reasonCodes": codes
+            }
 
     # --------------------------------------------------------
-    # Results ordered by candidateOrder
+    # Result ordering.
     # --------------------------------------------------------
+
+    if policy_valid:
+
+        order = policy[
+            "candidateOrder"
+        ]
+
+    else:
+
+        order = []
+
+    order_index = {
+        name: i
+        for i, name in enumerate(order)
+    }
 
     results = sorted(
         results_by_name.values(),
-        key=lambda result: (
+        key=lambda x: (
             order_index.get(
-                result["name"],
+                x["name"],
                 len(order)
             ),
-            utf8(result["name"])
+            x["name"].encode("utf-8")
         )
     )
 
     # --------------------------------------------------------
-    # Select winner
+    # Select winner.
+    #
+    # 1. smaller bytes
+    # 2. lower latency
+    # 3. candidateOrder
     # --------------------------------------------------------
 
     admitted = [
@@ -4553,7 +4558,7 @@ def quantize_select(body):
         if result["admitted"]
     ]
 
-    if admitted and not global_codes:
+    if admitted:
 
         winner = min(
             admitted,
@@ -4568,11 +4573,22 @@ def quantize_select(body):
         )
 
         selected = winner["name"]
-
-        # packageManifest must be the recorded winner object.
         package_manifest = winner.copy()
 
     else:
+
+        selected = None
+        package_manifest = None
+
+    # --------------------------------------------------------
+    # Global failure prevents selection.
+    # --------------------------------------------------------
+
+    global_codes = q5_sorted_codes(
+        global_codes
+    )
+
+    if global_codes:
 
         selected = None
         package_manifest = None
@@ -4602,7 +4618,6 @@ def quantize():
 
     try:
         body = request.get_json()
-
     except Exception:
 
         return app.response_class(
@@ -4632,13 +4647,13 @@ def quantize():
             mimetype="application/json"
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # FREEZE
-    # --------------------------------------------------------
+    # ========================================================
 
     if phase == "freeze":
 
-        result = quantize_freeze(body)
+        result = q5_freeze(body)
 
         if result is None:
 
@@ -4648,15 +4663,20 @@ def quantize():
                 mimetype="application/json"
             )
 
-        freeze_id = result["freezeId"]
+        freeze_id = result[
+            "freezeId"
+        ]
 
-        # Fingerprint entire freeze request.
+        # ----------------------------------------------------
+        # Fingerprint the original request.
+        # ----------------------------------------------------
+
         fingerprint = hashlib.sha256(
             json.dumps(
                 body,
                 ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":")
+                separators=(",", ":"),
+                sort_keys=True
             ).encode("utf-8")
         ).hexdigest()
 
@@ -4664,31 +4684,41 @@ def quantize():
             freeze_id
         )
 
-        # ----------------------------------------------------
-        # Identical replay
-        # ----------------------------------------------------
-
         if existing is not None:
 
-            if existing["fingerprint"] == fingerprint:
+            if existing[
+                "fingerprint"
+            ] == fingerprint:
 
                 return app.response_class(
-                    response=existing["response_json"],
+                    response=existing[
+                        "response_json"
+                    ],
                     status=200,
                     mimetype="application/json"
                 )
 
-            # Same freezeId but different input.
             return app.response_class(
                 response='{"error":"FREEZE_ID_CONFLICT"}',
                 status=409,
                 mimetype="application/json"
             )
 
-        response_json = compact_json(result)
+        response_json = json.dumps(
+            result,
+            ensure_ascii=False,
+            separators=(",", ":")
+        )
 
-        # Persist complete response.
-        QUANTIZE_FREEZES[freeze_id] = {
+        # IMPORTANT:
+        # Store the COMPLETE response.
+        # quantize_select reads:
+        #
+        # frozen["response"]["candidates"]
+        #
+        QUANTIZE_FREEZES[
+            freeze_id
+        ] = {
             "fingerprint": fingerprint,
             "response": result,
             "response_json": response_json
@@ -4700,11 +4730,11 @@ def quantize():
             mimetype="application/json"
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # SELECT
-    # --------------------------------------------------------
+    # ========================================================
 
-    result = quantize_select(body)
+    result = q5_select(body)
 
     if result is None:
 
@@ -4715,11 +4745,14 @@ def quantize():
         )
 
     return app.response_class(
-        response=compact_json(result),
+        response=json.dumps(
+            result,
+            ensure_ascii=False,
+            separators=(",", ":")
+        ),
         status=200,
         mimetype="application/json"
     )
-
 
 # ============================================================
 # Q6 - Recover a Content-Addressed ML Pipeline
