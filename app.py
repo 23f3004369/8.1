@@ -3,7 +3,9 @@ import json
 import math
 import re
 import unicodedata
-from datetime import datetime, timezone
+import os
+import threading
+from datetime import datetime, timezone, timedelta
 
 from flask import Flask, request
 
@@ -1032,6 +1034,686 @@ def build_corpus():
 def home():
     return "JSONL corpus service is running"
 
+
+
+# ============================================================
+# Q2 - Leakage-Safe BigQuery ML Experiment
+# Endpoint: POST /bqml
+#
+# This section is intentionally separated from Q1 so future
+# questions can be added as additional sections/endpoints.
+# ============================================================
+
+BQML_RUNS = {}
+BQML_LOCK = threading.Lock()
+
+SAFE_INT_MAX = 2**53 - 1
+
+
+def bqml_safe_integer(value):
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, int) and 0 <= value <= SAFE_INT_MAX
+
+
+def bqml_valid_digest(value):
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+    )
+
+
+def bqml_finite_unit(value):
+    if isinstance(value, bool):
+        return False
+    if not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(float(value)) and 0 <= float(value) <= 1
+
+
+def bqml_selection_row_valid(row):
+    if not isinstance(row, dict):
+        return False
+
+    if set(row.keys()) != {
+        "id", "entity", "eventTime", "predictionTime",
+        "version", "split", "features"
+    }:
+        return False
+
+    if not isinstance(row["id"], str):
+        return False
+    if not isinstance(row["entity"], str):
+        return False
+    if not isinstance(row["eventTime"], str):
+        return False
+    if not isinstance(row["predictionTime"], str):
+        return False
+
+    if not bqml_safe_integer(row["version"]):
+        return False
+
+    if row["split"] not in ("TRAIN", "EVAL"):
+        return False
+
+    if not isinstance(row["features"], dict):
+        return False
+
+    try:
+        parse_timestamp(row["eventTime"])
+        prediction_time = parse_timestamp(row["predictionTime"])
+    except Exception:
+        return False
+
+    for feature_name, feature in row["features"].items():
+        if not isinstance(feature_name, str):
+            return False
+
+        if not isinstance(feature, dict):
+            return False
+
+        if set(feature.keys()) != {"value", "availableAt"}:
+            return False
+
+        # Feature values are data; never execute or interpret them.
+        if not isinstance(feature["value"], str):
+            return False
+
+        if not isinstance(feature["availableAt"], str):
+            return False
+
+        try:
+            available_at = parse_timestamp(feature["availableAt"])
+        except Exception:
+            return False
+
+        if available_at > prediction_time:
+            return False
+
+    return True
+
+
+def bqml_deduplicate_rows(rows):
+    groups = {}
+
+    for row in rows:
+        event_time = parse_timestamp(row["eventTime"])
+        key = (row["entity"], event_time)
+        groups.setdefault(key, []).append(row)
+
+    retained = []
+
+    for group in groups.values():
+        group.sort(
+            key=lambda row: (
+                -row["version"],
+                utf8(row["id"])
+            )
+        )
+        retained.append(group[0])
+
+    return retained
+
+
+def bqml_eligible_features(rows, forbidden):
+    if not rows:
+        return []
+
+    common = set(rows[0]["features"].keys())
+
+    for row in rows[1:]:
+        common &= set(row["features"].keys())
+
+    result = []
+
+    for name in common:
+        if name in forbidden:
+            continue
+
+        eligible = True
+
+        for row in rows:
+            try:
+                available_at = parse_timestamp(
+                    row["features"][name]["availableAt"]
+                )
+                prediction_time = parse_timestamp(
+                    row["predictionTime"]
+                )
+            except Exception:
+                eligible = False
+                break
+
+            if available_at > prediction_time:
+                eligible = False
+                break
+
+        if eligible:
+            result.append(name)
+
+    return sorted(result, key=utf8)
+
+
+def bqml_trial_valid(trial):
+    if not isinstance(trial, dict):
+        return False
+
+    if set(trial.keys()) != {
+        "trialId", "status", "evalMetric"
+    }:
+        return False
+
+    if not bqml_safe_integer(trial["trialId"]):
+        return False
+
+    if trial["status"] not in ("SUCCEEDED", "FAILED"):
+        return False
+
+    metric = trial["evalMetric"]
+
+    if isinstance(metric, bool):
+        return False
+
+    if not isinstance(metric, (int, float)):
+        return False
+
+    return math.isfinite(float(metric))
+
+
+def bqml_selection_fingerprint(body):
+    return hashlib.sha256(
+        compact_json(body).encode("utf-8")
+    ).hexdigest()
+
+
+def bqml_select(body):
+    required = {
+        "phase", "runId", "forbiddenFeatures",
+        "numTrialsLimit", "rows", "trials"
+    }
+
+    if not isinstance(body, dict) or set(body.keys()) != required:
+        return None, None
+
+    reasons = []
+
+    run_id = body["runId"]
+
+    if (
+        not isinstance(run_id, str)
+        or len(run_id) == 0
+        or len(run_id) > 128
+    ):
+        reasons.append("INVALID_INPUT")
+
+    forbidden = body["forbiddenFeatures"]
+
+    if not isinstance(forbidden, list):
+        reasons.append("INVALID_INPUT")
+        forbidden = []
+    elif any(not isinstance(x, str) for x in forbidden):
+        reasons.append("INVALID_INPUT")
+
+    limit = body["numTrialsLimit"]
+
+    if not bqml_safe_integer(limit) or limit <= 0:
+        reasons.append("INVALID_INPUT")
+
+    rows = body["rows"]
+
+    if not isinstance(rows, list) or len(rows) == 0:
+        reasons.append("INVALID_INPUT")
+
+    trials = body["trials"]
+
+    if not isinstance(trials, list):
+        reasons.append("INVALID_INPUT")
+        trials = []
+
+    retained_rows = []
+    row_ids = set()
+
+    if isinstance(rows, list):
+        for row in rows:
+            if not bqml_selection_row_valid(row):
+                reasons.append("INVALID_INPUT")
+                continue
+
+            if row["id"] in row_ids:
+                reasons.append("INVALID_INPUT")
+                continue
+
+            row_ids.add(row["id"])
+            retained_rows.append(row)
+
+    valid_trials = []
+    trial_ids = set()
+
+    for trial in trials:
+        if not bqml_trial_valid(trial):
+            reasons.append("INVALID_INPUT")
+            continue
+
+        if trial["trialId"] in trial_ids:
+            reasons.append("INVALID_INPUT")
+            continue
+
+        trial_ids.add(trial["trialId"])
+
+        if trial["status"] == "SUCCEEDED":
+            valid_trials.append(trial)
+
+    if (
+        bqml_safe_integer(limit)
+        and limit > 0
+        and len(trials) > limit
+    ):
+        reasons.append("TRIAL_LIMIT_EXCEEDED")
+
+    reasons = sorted_codes(reasons)
+
+    if reasons:
+        response = {
+            "runId": run_id if isinstance(run_id, str) else "",
+            "selectedTrialId": None,
+            "trainRowIds": [],
+            "evalRowIds": [],
+            "featureNames": [],
+            "datasetDigest": None,
+            "reasonCodes": reasons
+        }
+        return response, bqml_selection_fingerprint(body)
+
+    if not valid_trials:
+        response = {
+            "runId": run_id,
+            "selectedTrialId": None,
+            "trainRowIds": [],
+            "evalRowIds": [],
+            "featureNames": [],
+            "datasetDigest": None,
+            "reasonCodes": ["NO_SUCCESSFUL_TRIAL"]
+        }
+        return response, bqml_selection_fingerprint(body)
+
+    retained_rows = bqml_deduplicate_rows(retained_rows)
+
+    feature_names = bqml_eligible_features(
+        retained_rows,
+        set(forbidden)
+    )
+
+    train_ids = sorted(
+        [
+            row["id"]
+            for row in retained_rows
+            if row["split"] == "TRAIN"
+        ],
+        key=utf8
+    )
+
+    eval_ids = sorted(
+        [
+            row["id"]
+            for row in retained_rows
+            if row["split"] == "EVAL"
+        ],
+        key=utf8
+    )
+
+    selected = sorted(
+        valid_trials,
+        key=lambda trial: (
+            -float(trial["evalMetric"]),
+            trial["trialId"]
+        )
+    )[0]
+
+    dataset_payload = {
+        "trainRowIds": train_ids,
+        "evalRowIds": eval_ids,
+        "featureNames": feature_names
+    }
+
+    dataset_digest = hashlib.sha256(
+        compact_json(dataset_payload).encode("utf-8")
+    ).hexdigest()
+
+    response = {
+        "runId": run_id,
+        "selectedTrialId": selected["trialId"],
+        "trainRowIds": train_ids,
+        "evalRowIds": eval_ids,
+        "featureNames": feature_names,
+        "datasetDigest": dataset_digest,
+        "reasonCodes": []
+    }
+
+    return response, bqml_selection_fingerprint(body)
+
+
+def bqml_test_row_valid(row):
+    if not isinstance(row, dict):
+        return False
+
+    if set(row.keys()) != {"label", "prediction", "slice"}:
+        return False
+
+    if (
+        isinstance(row["label"], bool)
+        or not isinstance(row["label"], int)
+        or row["label"] not in (0, 1)
+    ):
+        return False
+
+    if (
+        isinstance(row["prediction"], bool)
+        or not isinstance(row["prediction"], int)
+        or row["prediction"] not in (0, 1)
+    ):
+        return False
+
+    if not isinstance(row["slice"], str) or row["slice"] == "":
+        return False
+
+    return True
+
+
+def bqml_evaluate(body):
+    required = {
+        "phase", "runId", "selectedTrialId", "datasetDigest",
+        "metricFloor", "requiredSlices", "rows",
+        "bytesProcessed", "maxBytes"
+    }
+
+    if not isinstance(body, dict) or set(body.keys()) != required:
+        return {
+            "runId": body.get("runId", "") if isinstance(body, dict) else "",
+            "selectedTrialId": None,
+            "datasetDigest": None,
+            "testMetric": None,
+            "criticalSlicePass": False,
+            "decision": "reject",
+            "bytesProcessed": (
+                body.get("bytesProcessed", 0)
+                if isinstance(body, dict) else 0
+            ),
+            "reasonCodes": ["INVALID_INPUT"]
+        }
+
+    run_id = body["runId"]
+    selected_trial_id = body["selectedTrialId"]
+    dataset_digest = body["datasetDigest"]
+    metric_floor = body["metricFloor"]
+    required_slices = body["requiredSlices"]
+    rows = body["rows"]
+    bytes_processed = body["bytesProcessed"]
+    max_bytes = body["maxBytes"]
+
+    codes = []
+
+    if (
+        not isinstance(run_id, str)
+        or len(run_id) == 0
+        or len(run_id) > 128
+    ):
+        codes.append("INVALID_INPUT")
+
+    if not bqml_safe_integer(selected_trial_id):
+        codes.append("INVALID_INPUT")
+
+    if not bqml_valid_digest(dataset_digest):
+        codes.append("INVALID_INPUT")
+
+    if not bqml_finite_unit(metric_floor):
+        codes.append("INVALID_INPUT")
+
+    if not isinstance(required_slices, dict):
+        codes.append("INVALID_INPUT")
+        required_slices = {}
+    else:
+        for name, floor in required_slices.items():
+            if not isinstance(name, str) or name == "":
+                codes.append("INVALID_INPUT")
+            elif not bqml_finite_unit(floor):
+                codes.append("INVALID_INPUT")
+
+    if not isinstance(rows, list):
+        codes.append("INVALID_INPUT")
+
+    if not bqml_safe_integer(bytes_processed):
+        codes.append("INVALID_INPUT")
+
+    if not bqml_safe_integer(max_bytes):
+        codes.append("INVALID_INPUT")
+
+    with BQML_LOCK:
+        stored = BQML_RUNS.get(run_id) if isinstance(run_id, str) else None
+
+    if (
+        stored is None
+        or stored["selectedTrialId"] != selected_trial_id
+        or stored["datasetDigest"] != dataset_digest
+        or stored["reasonCodes"] != []
+    ):
+        codes.append("INVALID_LINEAGE")
+
+    valid_rows = True
+    valid_test_rows = []
+
+    if isinstance(rows, list):
+        for row in rows:
+            if not bqml_test_row_valid(row):
+                valid_rows = False
+            else:
+                valid_test_rows.append(row)
+
+        if not valid_rows:
+            codes.append("INVALID_TEST_ROW")
+
+    # Empty rows or any invalid row means no metric/slice checks.
+    skip_metric_checks = (
+        not isinstance(rows, list)
+        or len(rows) == 0
+        or not valid_rows
+    )
+
+    test_metric = None
+    critical_slice_pass = True
+
+    if skip_metric_checks:
+        critical_slice_pass = False
+
+    else:
+        correct = sum(
+            1
+            for row in valid_test_rows
+            if row["label"] == row["prediction"]
+        )
+
+        test_metric = round(
+            correct / len(valid_test_rows),
+            12
+        )
+
+        if test_metric < float(metric_floor):
+            codes.append("AGGREGATE_FLOOR")
+
+        slices = {}
+
+        for row in valid_test_rows:
+            slices.setdefault(row["slice"], []).append(row)
+
+        for slice_name, floor in required_slices.items():
+
+            if slice_name not in slices:
+                codes.append(f"MISSING_SLICE:{slice_name}")
+                critical_slice_pass = False
+                continue
+
+            slice_rows = slices[slice_name]
+
+            slice_correct = sum(
+                1
+                for row in slice_rows
+                if row["label"] == row["prediction"]
+            )
+
+            slice_metric = round(
+                slice_correct / len(slice_rows),
+                12
+            )
+
+            if slice_metric < float(floor):
+                codes.append(f"SLICE_FLOOR:{slice_name}")
+                critical_slice_pass = False
+
+    # criticalSlicePass is explicitly false for these conditions.
+    if (
+        "INVALID_INPUT" in codes
+        or "INVALID_LINEAGE" in codes
+        or "INVALID_TEST_ROW" in codes
+    ):
+        critical_slice_pass = False
+
+    if (
+        bqml_safe_integer(bytes_processed)
+        and bqml_safe_integer(max_bytes)
+        and bytes_processed > max_bytes
+    ):
+        codes.append("BYTE_LIMIT")
+
+    codes = sorted_codes(codes)
+
+    decision = "admit" if not codes else "reject"
+
+    return {
+        "runId": run_id,
+        "selectedTrialId": selected_trial_id,
+        "datasetDigest": dataset_digest,
+        "testMetric": test_metric,
+        "criticalSlicePass": bool(critical_slice_pass),
+        "decision": decision,
+        "bytesProcessed": bytes_processed,
+        "reasonCodes": codes
+    }
+
+
+@app.route("/bqml", methods=["POST"])
+def bqml():
+
+    if not request.is_json:
+        return app.response_class(
+            response='{"error":"INVALID_INPUT"}',
+            status=400,
+            mimetype="application/json"
+        )
+
+    try:
+        body = request.get_json()
+    except Exception:
+        return app.response_class(
+            response='{"error":"INVALID_INPUT"}',
+            status=400,
+            mimetype="application/json"
+        )
+
+    if not isinstance(body, dict):
+        return app.response_class(
+            response='{"error":"INVALID_INPUT"}',
+            status=400,
+            mimetype="application/json"
+        )
+
+    phase = body.get("phase")
+
+    if phase not in ("select", "evaluate"):
+        return app.response_class(
+            response='{"error":"INVALID_INPUT"}',
+            status=400,
+            mimetype="application/json"
+        )
+
+    if phase == "select":
+
+        run_id = body.get("runId")
+        fingerprint = bqml_selection_fingerprint(body)
+
+        if isinstance(run_id, str):
+
+            with BQML_LOCK:
+                existing = BQML_RUNS.get(run_id)
+
+            if existing is not None:
+
+                if existing["fingerprint"] == fingerprint:
+                    return app.response_class(
+                        response=existing["response_json"],
+                        status=200,
+                        mimetype="application/json"
+                    )
+
+                return app.response_class(
+                    response='{"error":"RUN_ID_CONFLICT"}',
+                    status=409,
+                    mimetype="application/json"
+                )
+
+        response, fingerprint = bqml_select(body)
+
+        if response is None:
+            return app.response_class(
+                response='{"error":"INVALID_INPUT"}',
+                status=400,
+                mimetype="application/json"
+            )
+
+        response_json = compact_json(response)
+
+        if isinstance(response.get("runId"), str):
+
+            with BQML_LOCK:
+
+                existing = BQML_RUNS.get(response["runId"])
+
+                if existing is not None:
+
+                    if existing["fingerprint"] == fingerprint:
+                        return app.response_class(
+                            response=existing["response_json"],
+                            status=200,
+                            mimetype="application/json"
+                        )
+
+                    return app.response_class(
+                        response='{"error":"RUN_ID_CONFLICT"}',
+                        status=409,
+                        mimetype="application/json"
+                    )
+
+                BQML_RUNS[response["runId"]] = {
+                    "fingerprint": fingerprint,
+                    "response": response,
+                    "response_json": response_json,
+                    "selectedTrialId": response["selectedTrialId"],
+                    "datasetDigest": response["datasetDigest"],
+                    "reasonCodes": response["reasonCodes"]
+                }
+
+        return app.response_class(
+            response=response_json,
+            status=200,
+            mimetype="application/json"
+        )
+
+    response = bqml_evaluate(body)
+
+    return app.response_class(
+        response=compact_json(response),
+        status=200,
+        mimetype="application/json"
+    )
 
 # ============================================================
 # Local execution
