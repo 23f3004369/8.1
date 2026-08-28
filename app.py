@@ -1078,14 +1078,33 @@ def bqml_valid_digest(value):
 
 
 def bqml_selection_row_valid(row):
+    """
+    Validate the structural contents of one selection row.
+
+    IMPORTANT:
+    availableAt being later than predictionTime does NOT
+    invalidate the row. It only makes that feature ineligible.
+
+    Feature values are opaque data and may be any JSON value.
+    """
+
     if not isinstance(row, dict):
         return False
 
     if set(row.keys()) != {
-        "id", "entity", "eventTime", "predictionTime",
-        "version", "split", "features"
+        "id",
+        "entity",
+        "eventTime",
+        "predictionTime",
+        "version",
+        "split",
+        "features"
     }:
         return False
+
+    # --------------------------------------------------------
+    # Basic row fields
+    # --------------------------------------------------------
 
     if not isinstance(row["id"], str):
         return False
@@ -1108,45 +1127,59 @@ def bqml_selection_row_valid(row):
     if not isinstance(row["features"], dict):
         return False
 
+    # --------------------------------------------------------
+    # eventTime and predictionTime must both be valid
+    # timestamps.
+    # --------------------------------------------------------
+
     try:
-        event_dt = parse_timestamp(row["eventTime"])
-        prediction_dt = parse_timestamp(row["predictionTime"])
+        parse_timestamp(row["eventTime"])
+        parse_timestamp(row["predictionTime"])
     except Exception:
         return False
 
-    # Point-in-time rule is evaluated against the row's
-    # predictionTime, using UTC-aware datetime objects.
-    for name, feature in row["features"].items():
+    # --------------------------------------------------------
+    # Validate feature structure.
+    #
+    # DO NOT check availableAt <= predictionTime here.
+    # That is an eligibility rule, not a row-validation rule.
+    #
+    # DO NOT require feature["value"] to be a string.
+    # It is opaque data.
+    # --------------------------------------------------------
 
-        if not isinstance(name, str):
+    for feature_name, feature in row["features"].items():
+
+        # JSON object keys are strings, but keep the explicit
+        # check for deterministic validation.
+        if not isinstance(feature_name, str):
             return False
 
         if not isinstance(feature, dict):
             return False
 
-        if set(feature.keys()) != {"value", "availableAt"}:
+        if set(feature.keys()) != {
+            "value",
+            "availableAt"
+        }:
             return False
 
-        # Feature value is opaque data.
-        if not isinstance(feature["value"], str):
-            return False
+        # Feature value is intentionally NOT type-restricted.
+        # It is data.
 
-        if not isinstance(feature["availableAt"], str):
+        if not isinstance(
+            feature["availableAt"],
+            str
+        ):
             return False
 
         try:
-            available_dt = parse_timestamp(
+            parse_timestamp(
                 feature["availableAt"]
             )
         except Exception:
             return False
 
-        if available_dt > prediction_dt:
-            return False
-
-    # eventTime and predictionTime only need to be valid
-    # instants. They are not required to have a particular
-    # ordering by the specification.
     return True
 
 
@@ -1190,76 +1223,75 @@ def bqml_deduplicate_rows(rows):
 
 def bqml_eligible_features(rows, forbidden):
     """
-    A feature is eligible iff:
-      - it appears in every retained row
-      - it is not forbidden
-      - availableAt <= predictionTime for every row
+    Feature eligibility is determined AFTER row validation
+    and AFTER deduplication.
+
+    A feature is eligible only if:
+
+      1. It appears in every retained row.
+      2. It is not forbidden.
+      3. In every retained row:
+             availableAt <= predictionTime
+
+    Feature names are sorted by UTF-8 bytes.
     """
 
     if not rows:
         return []
 
-    common = set(rows[0]["features"].keys())
+    # --------------------------------------------------------
+    # Feature must occur in EVERY retained row.
+    # --------------------------------------------------------
+
+    common_features = set(
+        rows[0]["features"].keys()
+    )
 
     for row in rows[1:]:
-        common.intersection_update(
+        common_features.intersection_update(
             row["features"].keys()
         )
 
     eligible = []
 
-    for name in common:
+    # --------------------------------------------------------
+    # Apply forbidden + point-in-time conditions.
+    # --------------------------------------------------------
 
-        if name in forbidden:
+    for feature_name in common_features:
+
+        if feature_name in forbidden:
             continue
 
-        okay = True
+        available_for_all = True
 
         for row in rows:
 
-            feature = row["features"][name]
-
-            available_dt = parse_timestamp(
-                feature["availableAt"]
+            available_at = parse_timestamp(
+                row["features"][
+                    feature_name
+                ]["availableAt"]
             )
 
-            prediction_dt = parse_timestamp(
+            prediction_time = parse_timestamp(
                 row["predictionTime"]
             )
 
-            if available_dt > prediction_dt:
-                okay = False
+            if available_at > prediction_time:
+                available_for_all = False
                 break
 
-        if okay:
-            eligible.append(name)
+        if available_for_all:
+            eligible.append(feature_name)
 
-    return sorted(eligible, key=utf8)
+    # --------------------------------------------------------
+    # Required UTF-8-byte ordering.
+    # --------------------------------------------------------
 
-
-def bqml_trial_shape_valid(trial):
-    if not isinstance(trial, dict):
-        return False
-
-    if set(trial.keys()) != {
-        "trialId",
-        "status",
-        "evalMetric"
-    }:
-        return False
-
-    if not bqml_safe_integer(
-        trial["trialId"]
-    ):
-        return False
-
-    if trial["status"] not in (
-        "SUCCEEDED",
-        "FAILED"
-    ):
-        return False
-
-    return True
+    return sorted(
+        eligible,
+        key=utf8
+    )
 
 
 def bqml_successful_trial_eligible(trial):
