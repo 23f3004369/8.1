@@ -1035,6 +1035,8 @@ def home():
     return "JSONL corpus service is running"
 
 
+
+
 # ============================================================
 # Q2 - Leakage-Safe BigQuery ML Experiment
 # Endpoint: POST /bqml
@@ -1042,19 +1044,10 @@ def home():
 
 BQML_RUNS = {}
 BQML_LOCK = threading.Lock()
-
 BQML_SAFE_INT_MAX = 2**53 - 1
 
 
-# ============================================================
-# Q2 basic validation helpers
-# ============================================================
-
 def bqml_safe_integer(value):
-    """
-    Non-negative JavaScript-safe integer.
-    Maximum = 2^53 - 1.
-    """
     return (
         isinstance(value, int)
         and not isinstance(value, bool)
@@ -1063,13 +1056,11 @@ def bqml_safe_integer(value):
 
 
 def bqml_finite_number(value):
-    if isinstance(value, bool):
-        return False
-
-    if not isinstance(value, (int, float)):
-        return False
-
-    return math.isfinite(float(value))
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
 
 
 def bqml_finite_unit(value):
@@ -1086,113 +1077,57 @@ def bqml_valid_digest(value):
     )
 
 
-# ============================================================
-# Q2 timestamp helper
-# ============================================================
-
-def bqml_parse_timestamp(value):
-    """
-    Reuse Q1's strict timestamp parser.
-
-    The returned datetime is timezone-aware and normalized
-    to UTC, so comparisons are true instant comparisons.
-    """
-    return parse_timestamp(value)
-
-
-# ============================================================
-# Selection-row validation
-# ============================================================
-
 def bqml_selection_row_valid(row):
-    """
-    Validate one selection row.
-
-    Required shape:
-
-    {
-        id,
-        entity,
-        eventTime,
-        predictionTime,
-        version,
-        split,
-        features
-    }
-    """
-
     if not isinstance(row, dict):
         return False
 
     if set(row.keys()) != {
-        "id",
-        "entity",
-        "eventTime",
-        "predictionTime",
-        "version",
-        "split",
-        "features"
+        "id", "entity", "eventTime", "predictionTime",
+        "version", "split", "features"
     }:
         return False
 
-    # id and entity are strings.
     if not isinstance(row["id"], str):
         return False
 
     if not isinstance(row["entity"], str):
         return False
 
-    # Timestamp strings.
     if not isinstance(row["eventTime"], str):
         return False
 
     if not isinstance(row["predictionTime"], str):
         return False
 
-    # Version must be a non-negative safe integer.
     if not bqml_safe_integer(row["version"]):
         return False
 
-    # Selection is explicitly TRAIN/EVAL only.
     if row["split"] not in ("TRAIN", "EVAL"):
         return False
 
-    # Features must be an object.
     if not isinstance(row["features"], dict):
         return False
 
-    # Parse both timestamps as UTC instants.
     try:
-        event_time = bqml_parse_timestamp(
-            row["eventTime"]
-        )
-
-        prediction_time = bqml_parse_timestamp(
-            row["predictionTime"]
-        )
+        event_dt = parse_timestamp(row["eventTime"])
+        prediction_dt = parse_timestamp(row["predictionTime"])
     except Exception:
         return False
 
-    # --------------------------------------------------------
-    # Feature point-in-time validation
-    # --------------------------------------------------------
+    # Point-in-time rule is evaluated against the row's
+    # predictionTime, using UTC-aware datetime objects.
+    for name, feature in row["features"].items():
 
-    for feature_name, feature in row["features"].items():
-
-        if not isinstance(feature_name, str):
+        if not isinstance(name, str):
             return False
 
         if not isinstance(feature, dict):
             return False
 
-        if set(feature.keys()) != {
-            "value",
-            "availableAt"
-        }:
+        if set(feature.keys()) != {"value", "availableAt"}:
             return False
 
-        # Feature value is DATA.
-        # We never execute/interpolate/interpret it.
+        # Feature value is opaque data.
         if not isinstance(feature["value"], str):
             return False
 
@@ -1200,49 +1135,38 @@ def bqml_selection_row_valid(row):
             return False
 
         try:
-            available_at = bqml_parse_timestamp(
+            available_dt = parse_timestamp(
                 feature["availableAt"]
             )
         except Exception:
             return False
 
-        # Point-in-time rule:
-        # the feature must have existed by prediction time.
-        if available_at > prediction_time:
+        if available_dt > prediction_dt:
             return False
 
+    # eventTime and predictionTime only need to be valid
+    # instants. They are not required to have a particular
+    # ordering by the specification.
     return True
 
 
-# ============================================================
-# Deduplication
-# ============================================================
-
 def bqml_deduplicate_rows(rows):
     """
-    Deduplicate by:
+    Deduplicate by [entity, UTC(eventTime)].
 
-        [entity, UTC(eventTime)]
-
-    Winner:
-
-        1. highest version
-        2. UTF-8-byte-smallest id
+    Keep:
+      1. highest version
+      2. UTF-8-byte-smallest ID
     """
 
     groups = {}
 
     for row in rows:
-
-        # Compare eventTime as an actual UTC instant,
-        # not as the original timestamp string.
-        event_time_utc = bqml_parse_timestamp(
-            row["eventTime"]
-        )
+        event_dt = parse_timestamp(row["eventTime"])
 
         key = (
             row["entity"],
-            event_time_utc
+            event_dt
         )
 
         groups.setdefault(key, []).append(row)
@@ -1251,101 +1175,69 @@ def bqml_deduplicate_rows(rows):
 
     for group in groups.values():
 
-        group.sort(
+        winner = min(
+            group,
             key=lambda row: (
                 -row["version"],
                 utf8(row["id"])
             )
         )
 
-        retained.append(group[0])
+        retained.append(winner)
 
     return retained
 
 
-# ============================================================
-# Shared / eligible features
-# ============================================================
-
-def bqml_eligible_features(rows, forbidden_features):
+def bqml_eligible_features(rows, forbidden):
     """
-    A feature is eligible only when:
-
-    1. It occurs in EVERY retained row.
-    2. It is not forbidden.
-    3. availableAt <= predictionTime in EVERY retained row.
-
-    Feature names are sorted by UTF-8 bytes.
+    A feature is eligible iff:
+      - it appears in every retained row
+      - it is not forbidden
+      - availableAt <= predictionTime for every row
     """
 
     if not rows:
         return []
 
-    # Start with all features from the first retained row.
-    common_features = set(
-        rows[0]["features"].keys()
-    )
+    common = set(rows[0]["features"].keys())
 
-    # Intersect with every other retained row.
     for row in rows[1:]:
-        common_features &= set(
+        common.intersection_update(
             row["features"].keys()
         )
 
     eligible = []
 
-    for feature_name in common_features:
+    for name in common:
 
-        # Forbidden features are never eligible.
-        if feature_name in forbidden_features:
+        if name in forbidden:
             continue
 
-        eligible_for_all_rows = True
+        okay = True
 
         for row in rows:
 
-            feature = row["features"][feature_name]
+            feature = row["features"][name]
 
-            try:
-                available_at = bqml_parse_timestamp(
-                    feature["availableAt"]
-                )
+            available_dt = parse_timestamp(
+                feature["availableAt"]
+            )
 
-                prediction_time = bqml_parse_timestamp(
-                    row["predictionTime"]
-                )
-            except Exception:
-                eligible_for_all_rows = False
+            prediction_dt = parse_timestamp(
+                row["predictionTime"]
+            )
+
+            if available_dt > prediction_dt:
+                okay = False
                 break
 
-            # Strict point-in-time availability test.
-            if available_at > prediction_time:
-                eligible_for_all_rows = False
-                break
+        if okay:
+            eligible.append(name)
 
-        if eligible_for_all_rows:
-            eligible.append(feature_name)
-
-    return sorted(
-        eligible,
-        key=utf8
-    )
+    return sorted(eligible, key=utf8)
 
 
-# ============================================================
-# Trial validation
-# ============================================================
-
-def bqml_trial_valid_shape(trial):
-    """
-    Validate the structural fields of a trial.
-
-    Important:
-    A FAILED trial does not need a finite metric because it
-    cannot be selected anyway. Only SUCCEEDED trials need a
-    finite evalMetric to be eligible.
-    """
-
+def bqml_trial_shape_valid(trial):
     if not isinstance(trial, dict):
         return False
 
@@ -1371,21 +1263,13 @@ def bqml_trial_valid_shape(trial):
 
 
 def bqml_successful_trial_eligible(trial):
-    """
-    Only SUCCEEDED + finite evalMetric trials can be selected.
-    """
-
-    if trial["status"] != "SUCCEEDED":
-        return False
-
-    return bqml_finite_number(
-        trial["evalMetric"]
+    return (
+        trial["status"] == "SUCCEEDED"
+        and bqml_finite_number(
+            trial["evalMetric"]
+        )
     )
 
-
-# ============================================================
-# Selection fingerprint
-# ============================================================
 
 def bqml_selection_fingerprint(body):
     return hashlib.sha256(
@@ -1393,13 +1277,9 @@ def bqml_selection_fingerprint(body):
     ).hexdigest()
 
 
-# ============================================================
-# SELECT phase
-# ============================================================
-
 def bqml_select(body):
 
-    required_keys = {
+    required = {
         "phase",
         "runId",
         "forbiddenFeatures",
@@ -1410,56 +1290,40 @@ def bqml_select(body):
 
     if (
         not isinstance(body, dict)
-        or set(body.keys()) != required_keys
+        or set(body.keys()) != required
+        or body.get("phase") != "select"
     ):
         return None, None
 
-    reasons = []
-
-    # --------------------------------------------------------
-    # runId
-    # --------------------------------------------------------
+    codes = []
 
     run_id = body["runId"]
 
     if (
         not isinstance(run_id, str)
-        or len(run_id) == 0
+        or not run_id
         or len(run_id) > 128
     ):
-        reasons.append("INVALID_INPUT")
-
-    # --------------------------------------------------------
-    # forbiddenFeatures
-    # --------------------------------------------------------
+        codes.append("INVALID_INPUT")
 
     forbidden = body["forbiddenFeatures"]
 
     if not isinstance(forbidden, list):
-        reasons.append("INVALID_INPUT")
+        codes.append("INVALID_INPUT")
         forbidden = []
-
     elif any(
-        not isinstance(feature, str)
-        for feature in forbidden
+        not isinstance(x, str)
+        for x in forbidden
     ):
-        reasons.append("INVALID_INPUT")
+        codes.append("INVALID_INPUT")
 
-    # --------------------------------------------------------
-    # numTrialsLimit
-    # --------------------------------------------------------
-
-    trial_limit = body["numTrialsLimit"]
+    limit = body["numTrialsLimit"]
 
     if (
-        not bqml_safe_integer(trial_limit)
-        or trial_limit <= 0
+        not bqml_safe_integer(limit)
+        or limit <= 0
     ):
-        reasons.append("INVALID_INPUT")
-
-    # --------------------------------------------------------
-    # rows
-    # --------------------------------------------------------
+        codes.append("INVALID_INPUT")
 
     rows = body["rows"]
 
@@ -1467,86 +1331,64 @@ def bqml_select(body):
         not isinstance(rows, list)
         or len(rows) == 0
     ):
-        reasons.append("INVALID_INPUT")
-
-    # --------------------------------------------------------
-    # trials
-    # --------------------------------------------------------
+        codes.append("INVALID_INPUT")
 
     trials = body["trials"]
 
     if not isinstance(trials, list):
-        reasons.append("INVALID_INPUT")
+        codes.append("INVALID_INPUT")
         trials = []
 
-    # --------------------------------------------------------
-    # Validate rows
-    # --------------------------------------------------------
-
     valid_rows = []
-    seen_row_ids = set()
+    seen_ids = set()
 
     if isinstance(rows, list):
 
         for row in rows:
 
             if not bqml_selection_row_valid(row):
-                reasons.append("INVALID_INPUT")
+                codes.append("INVALID_INPUT")
                 continue
 
-            # IDs must be unique within the input array.
-            if row["id"] in seen_row_ids:
-                reasons.append("INVALID_INPUT")
+            if row["id"] in seen_ids:
+                codes.append("INVALID_INPUT")
                 continue
 
-            seen_row_ids.add(row["id"])
+            seen_ids.add(row["id"])
             valid_rows.append(row)
-
-    # --------------------------------------------------------
-    # Validate trials
-    # --------------------------------------------------------
 
     valid_trials = []
     seen_trial_ids = set()
 
     for trial in trials:
 
-        if not bqml_trial_valid_shape(trial):
-            reasons.append("INVALID_INPUT")
+        if not bqml_trial_shape_valid(trial):
+            codes.append("INVALID_INPUT")
             continue
 
         trial_id = trial["trialId"]
 
         if trial_id in seen_trial_ids:
-            reasons.append("INVALID_INPUT")
+            codes.append("INVALID_INPUT")
             continue
 
         seen_trial_ids.add(trial_id)
 
-        # Only successful + finite trials are eligible.
+        # FAILED trials are structurally valid regardless of
+        # metric value. Only finite SUCCEEDED trials compete.
         if bqml_successful_trial_eligible(trial):
             valid_trials.append(trial)
 
-    # --------------------------------------------------------
-    # Trial limit
-    # --------------------------------------------------------
-
     if (
-        bqml_safe_integer(trial_limit)
-        and trial_limit > 0
-        and len(trials) > trial_limit
+        bqml_safe_integer(limit)
+        and limit > 0
+        and len(trials) > limit
     ):
-        reasons.append(
-            "TRIAL_LIMIT_EXCEEDED"
-        )
+        codes.append("TRIAL_LIMIT_EXCEEDED")
 
-    reasons = sorted_codes(reasons)
+    codes = sorted_codes(codes)
 
-    # --------------------------------------------------------
-    # Malformed selection
-    # --------------------------------------------------------
-
-    if reasons:
+    if codes:
 
         response = {
             "runId": (
@@ -1559,17 +1401,13 @@ def bqml_select(body):
             "evalRowIds": [],
             "featureNames": [],
             "datasetDigest": None,
-            "reasonCodes": reasons
+            "reasonCodes": codes
         }
 
         return (
             response,
             bqml_selection_fingerprint(body)
         )
-
-    # --------------------------------------------------------
-    # No eligible successful trial
-    # --------------------------------------------------------
 
     if not valid_trials:
 
@@ -1590,53 +1428,37 @@ def bqml_select(body):
             bqml_selection_fingerprint(body)
         )
 
-    # --------------------------------------------------------
-    # Deduplicate AFTER validating all rows.
-    # --------------------------------------------------------
-
-    retained_rows = bqml_deduplicate_rows(
+    # Deduplicate first. Feature eligibility is based on
+    # the retained rows, not the raw rows.
+    retained = bqml_deduplicate_rows(
         valid_rows
     )
 
-    # --------------------------------------------------------
-    # Determine shared point-in-time features.
-    # --------------------------------------------------------
-
     feature_names = bqml_eligible_features(
-        retained_rows,
+        retained,
         set(forbidden)
     )
 
-    # --------------------------------------------------------
-    # TRAIN/EVAL IDs
-    # --------------------------------------------------------
-
-    train_row_ids = sorted(
+    train_ids = sorted(
         [
             row["id"]
-            for row in retained_rows
+            for row in retained
             if row["split"] == "TRAIN"
         ],
         key=utf8
     )
 
-    eval_row_ids = sorted(
+    eval_ids = sorted(
         [
             row["id"]
-            for row in retained_rows
+            for row in retained
             if row["split"] == "EVAL"
         ],
         key=utf8
     )
 
-    # --------------------------------------------------------
-    # Select best eligible trial.
-    #
-    # Highest evalMetric first.
-    # Exact metric tie -> smallest integer trialId.
-    # --------------------------------------------------------
-
-    selected_trial = min(
+    # Maximize evalMetric; exact tie -> smallest integer ID.
+    selected = min(
         valid_trials,
         key=lambda trial: (
             -float(trial["evalMetric"]),
@@ -1644,20 +1466,9 @@ def bqml_select(body):
         )
     )
 
-    selected_trial_id = selected_trial["trialId"]
-
-    # --------------------------------------------------------
-    # Dataset digest
-    #
-    # Exact key order:
-    # trainRowIds
-    # evalRowIds
-    # featureNames
-    # --------------------------------------------------------
-
     digest_payload = {
-        "trainRowIds": train_row_ids,
-        "evalRowIds": eval_row_ids,
+        "trainRowIds": train_ids,
+        "evalRowIds": eval_ids,
         "featureNames": feature_names
     }
 
@@ -1667,15 +1478,11 @@ def bqml_select(body):
         ).encode("utf-8")
     ).hexdigest()
 
-    # --------------------------------------------------------
-    # Final successful selection
-    # --------------------------------------------------------
-
     response = {
         "runId": run_id,
-        "selectedTrialId": selected_trial_id,
-        "trainRowIds": train_row_ids,
-        "evalRowIds": eval_row_ids,
+        "selectedTrialId": selected["trialId"],
+        "trainRowIds": train_ids,
+        "evalRowIds": eval_ids,
         "featureNames": feature_names,
         "datasetDigest": dataset_digest,
         "reasonCodes": []
@@ -1687,12 +1494,7 @@ def bqml_select(body):
     )
 
 
-# ============================================================
-# Test-row validation
-# ============================================================
-
 def bqml_test_row_valid(row):
-
     if not isinstance(row, dict):
         return False
 
@@ -1703,7 +1505,6 @@ def bqml_test_row_valid(row):
     }:
         return False
 
-    # Binary integer labels.
     if (
         isinstance(row["label"], bool)
         or not isinstance(row["label"], int)
@@ -1711,7 +1512,6 @@ def bqml_test_row_valid(row):
     ):
         return False
 
-    # Binary integer predictions.
     if (
         isinstance(row["prediction"], bool)
         or not isinstance(row["prediction"], int)
@@ -1719,7 +1519,6 @@ def bqml_test_row_valid(row):
     ):
         return False
 
-    # Slice must be non-empty string.
     if (
         not isinstance(row["slice"], str)
         or row["slice"] == ""
@@ -1729,13 +1528,9 @@ def bqml_test_row_valid(row):
     return True
 
 
-# ============================================================
-# EVALUATE phase
-# ============================================================
-
 def bqml_evaluate(body):
 
-    required_keys = {
+    required = {
         "phase",
         "runId",
         "selectedTrialId",
@@ -1747,13 +1542,10 @@ def bqml_evaluate(body):
         "maxBytes"
     }
 
-    # --------------------------------------------------------
-    # Malformed request shape
-    # --------------------------------------------------------
-
     if (
         not isinstance(body, dict)
-        or set(body.keys()) != required_keys
+        or set(body.keys()) != required
+        or body.get("phase") != "evaluate"
     ):
         return {
             "runId": (
@@ -1771,9 +1563,7 @@ def bqml_evaluate(body):
                 if isinstance(body, dict)
                 else 0
             ),
-            "reasonCodes": [
-                "INVALID_INPUT"
-            ]
+            "reasonCodes": ["INVALID_INPUT"]
         }
 
     run_id = body["runId"]
@@ -1787,60 +1577,38 @@ def bqml_evaluate(body):
 
     codes = []
 
-    # --------------------------------------------------------
-    # runId
-    # --------------------------------------------------------
-
     if (
         not isinstance(run_id, str)
-        or len(run_id) == 0
+        or not run_id
         or len(run_id) > 128
     ):
         codes.append("INVALID_INPUT")
 
-    # --------------------------------------------------------
-    # selectedTrialId
-    # --------------------------------------------------------
-
+    # Evaluation specifically requires a non-null selected integer.
     if not bqml_safe_integer(
         selected_trial_id
     ):
         codes.append("INVALID_INPUT")
-
-    # --------------------------------------------------------
-    # datasetDigest
-    # --------------------------------------------------------
 
     if not bqml_valid_digest(
         dataset_digest
     ):
         codes.append("INVALID_INPUT")
 
-    # --------------------------------------------------------
-    # metricFloor
-    # --------------------------------------------------------
-
     if not bqml_finite_unit(
         metric_floor
     ):
         codes.append("INVALID_INPUT")
 
-    # --------------------------------------------------------
-    # requiredSlices
-    # --------------------------------------------------------
-
     if not isinstance(required_slices, dict):
-
         codes.append("INVALID_INPUT")
         required_slices = {}
-
     else:
-
-        for slice_name, floor in required_slices.items():
+        for name, floor in required_slices.items():
 
             if (
-                not isinstance(slice_name, str)
-                or slice_name == ""
+                not isinstance(name, str)
+                or name == ""
             ):
                 codes.append("INVALID_INPUT")
                 continue
@@ -1848,16 +1616,8 @@ def bqml_evaluate(body):
             if not bqml_finite_unit(floor):
                 codes.append("INVALID_INPUT")
 
-    # --------------------------------------------------------
-    # rows
-    # --------------------------------------------------------
-
     if not isinstance(rows, list):
         codes.append("INVALID_INPUT")
-
-    # --------------------------------------------------------
-    # byte counts
-    # --------------------------------------------------------
 
     if not bqml_safe_integer(
         bytes_processed
@@ -1882,73 +1642,59 @@ def bqml_evaluate(body):
 
     if (
         stored is None
+        or stored["reasonCodes"] != []
         or stored["selectedTrialId"] != selected_trial_id
         or stored["datasetDigest"] != dataset_digest
-        or stored["reasonCodes"] != []
     ):
         codes.append("INVALID_LINEAGE")
 
     # --------------------------------------------------------
-    # Validate ALL final-test rows
+    # Validate final-test rows.
+    # Selection NEVER sees these rows.
     # --------------------------------------------------------
 
     valid_test_rows = []
-    all_test_rows_valid = True
+    every_row_valid = True
 
     if isinstance(rows, list):
 
         for row in rows:
 
             if not bqml_test_row_valid(row):
-                all_test_rows_valid = False
+                every_row_valid = False
             else:
                 valid_test_rows.append(row)
 
-        if not all_test_rows_valid:
+        if not every_row_valid:
             codes.append("INVALID_TEST_ROW")
 
-    # --------------------------------------------------------
-    # Metric and slice checks
-    #
-    # Empty rows OR any invalid row:
-    #   testMetric = null
-    #   skip aggregate checks
-    #   skip slice checks
-    # --------------------------------------------------------
-
+    # Empty rows or any invalid row:
+    # no aggregate/slice calculations.
     skip_metric_checks = (
         not isinstance(rows, list)
         or len(rows) == 0
-        or not all_test_rows_valid
+        or not every_row_valid
     )
 
     test_metric = None
 
-    # Per specification:
-    # criticalSlicePass is false for invalid input,
-    # invalid lineage, invalid test row, missing slice,
-    # or failed slice floor.
-    critical_slice_pass = True
-
-    if (
+    # This gate is specifically about the required slices.
+    critical_slice_pass = not (
         "INVALID_INPUT" in codes
         or "INVALID_LINEAGE" in codes
         or "INVALID_TEST_ROW" in codes
         or skip_metric_checks
-    ):
-        critical_slice_pass = False
-
-    # --------------------------------------------------------
-    # Aggregate and required slices
-    # --------------------------------------------------------
+    )
 
     if not skip_metric_checks:
 
-        # Aggregate accuracy.
+        # ----------------------------------------------------
+        # Aggregate accuracy
+        # ----------------------------------------------------
+
         correct = sum(
-            1
+            row["label"] == row["prediction"]
             for row in valid_test_rows
-            if row["label"] == row["prediction"]
         )
 
         test_metric = round(
@@ -1956,13 +1702,15 @@ def bqml_evaluate(body):
             12
         )
 
-        # Inclusive aggregate floor.
         if test_metric < float(metric_floor):
             codes.append(
                 "AGGREGATE_FLOOR"
             )
 
-        # Group rows by slice.
+        # ----------------------------------------------------
+        # Required slices
+        # ----------------------------------------------------
+
         slice_groups = {}
 
         for row in valid_test_rows:
@@ -1971,7 +1719,6 @@ def bqml_evaluate(body):
                 []
             ).append(row)
 
-        # Every required slice must exist.
         for slice_name, floor in required_slices.items():
 
             if slice_name not in slice_groups:
@@ -1988,9 +1735,8 @@ def bqml_evaluate(body):
             ]
 
             slice_correct = sum(
-                1
+                row["label"] == row["prediction"]
                 for row in slice_rows
-                if row["label"] == row["prediction"]
             )
 
             slice_accuracy = round(
@@ -1998,7 +1744,6 @@ def bqml_evaluate(body):
                 12
             )
 
-            # Inclusive slice floor.
             if slice_accuracy < float(floor):
 
                 codes.append(
@@ -2008,10 +1753,7 @@ def bqml_evaluate(body):
                 critical_slice_pass = False
 
     # --------------------------------------------------------
-    # Byte gate
-    #
-    # This must still be checked even if rows are empty or
-    # invalid.
+    # Cost gate
     # --------------------------------------------------------
 
     if (
@@ -2021,22 +1763,13 @@ def bqml_evaluate(body):
     ):
         codes.append("BYTE_LIMIT")
 
-    # --------------------------------------------------------
-    # Final reason-code ordering
-    # --------------------------------------------------------
-
     codes = sorted_codes(codes)
 
-    # Admit ONLY when there are no failure codes.
     decision = (
         "admit"
-        if len(codes) == 0
+        if not codes
         else "reject"
     )
-
-    # --------------------------------------------------------
-    # Final evaluation response
-    # --------------------------------------------------------
 
     return {
         "runId": run_id,
@@ -2052,16 +1785,8 @@ def bqml_evaluate(body):
     }
 
 
-# ============================================================
-# /bqml endpoint
-# ============================================================
-
 @app.route("/bqml", methods=["POST"])
 def bqml():
-
-    # --------------------------------------------------------
-    # Request parsing
-    # --------------------------------------------------------
 
     if not request.is_json:
         return app.response_class(
@@ -2088,7 +1813,6 @@ def bqml():
 
     phase = body.get("phase")
 
-    # Unknown or missing phase.
     if phase not in (
         "select",
         "evaluate"
@@ -2106,14 +1830,9 @@ def bqml():
     if phase == "select":
 
         run_id = body.get("runId")
-        fingerprint = bqml_selection_fingerprint(
-            body
-        )
+        fingerprint = bqml_selection_fingerprint(body)
 
-        # ----------------------------------------------------
-        # Existing runId
-        # ----------------------------------------------------
-
+        # Identical replay / runId conflict.
         if isinstance(run_id, str):
 
             with BQML_LOCK:
@@ -2121,7 +1840,6 @@ def bqml():
 
             if existing is not None:
 
-                # Exact replay.
                 if (
                     existing["fingerprint"]
                     == fingerprint
@@ -2132,20 +1850,13 @@ def bqml():
                         mimetype="application/json"
                     )
 
-                # Same runId, different selection input.
                 return app.response_class(
                     response='{"error":"RUN_ID_CONFLICT"}',
                     status=409,
                     mimetype="application/json"
                 )
 
-        # ----------------------------------------------------
-        # New selection
-        # ----------------------------------------------------
-
-        response, fingerprint = bqml_select(
-            body
-        )
+        response, fingerprint = bqml_select(body)
 
         if response is None:
             return app.response_class(
@@ -2154,15 +1865,8 @@ def bqml():
                 mimetype="application/json"
             )
 
-        response_json = compact_json(
-            response
-        )
-
+        response_json = compact_json(response)
         response_run_id = response["runId"]
-
-        # ----------------------------------------------------
-        # Persist COMPLETE selection response.
-        # ----------------------------------------------------
 
         if isinstance(response_run_id, str):
 
@@ -2190,6 +1894,7 @@ def bqml():
                         mimetype="application/json"
                     )
 
+                # Persist complete selection response.
                 BQML_RUNS[response_run_id] = {
                     "fingerprint": fingerprint,
                     "response": response,
